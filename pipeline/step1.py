@@ -14,20 +14,12 @@ from scipy.interpolate import interp1d
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config
 from config import (
-    BINARY_DIR, CACHE_DIR, DEPLOY_YAML, OUTPUT_DIR, GLIDER_ID,
+    BINARY_DIR, CACHE_DIR, DEPLOY_YAML, OUTPUT_DIR,
+    GPS_LAT_MIN, GPS_LAT_MAX, GPS_LON_MIN, GPS_LON_MAX,
     TEMP_MIN, TEMP_MAX, COND_MIN, PRES_MIN,
-    PROFILE_FILT_SECS, PROFILE_MIN_SECS,
+    PROFILE_FILT_SECS, PROFILE_MIN_SECS, GLIDER_ID,
 )
-
-COND_MAX = 15.0
-
-
-def _gps_bounds():
-    """Read GPS bounds from config at call time (detect_deployment may update them)."""
-    return (config.GPS_LAT_MIN, config.GPS_LAT_MAX,
-            config.GPS_LON_MIN, config.GPS_LON_MAX)
 
 try:
     import gsw
@@ -78,27 +70,75 @@ def load_config(yaml_path):
     return config
 
 
+def _sanitize_cache_dir(cache_dir):
+    """
+    Remove any .cac files that contain non-ASCII bytes.
+    dbdreader's read_cache does a hard .decode('ascii') with no error handling,
+    so a single corrupted .cac file (e.g. with Latin-1 sensor names) will crash
+    the entire MultiDBD open. We pre-screen and delete bad files so dbdreader
+    can rebuild them cleanly.
+    """
+    if not os.path.isdir(cache_dir):
+        return
+    removed = 0
+    for fn in os.listdir(cache_dir):
+        if not fn.endswith(".cac"):
+            continue
+        fp = os.path.join(cache_dir, fn)
+        try:
+            with open(fp, "rb") as fh:
+                data = fh.read()
+            data.decode("ascii")          # will raise if non-ASCII
+        except (UnicodeDecodeError, OSError):
+            try:
+                os.remove(fp)
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"  Removed {removed} corrupted .cac file(s) from cache dir")
+
+
+def _open_multidbd(filenames, cache_dir):
+    """
+    Open a dbdreader.MultiDBD, sanitizing the cache dir first.
+    If it still fails with UnicodeDecodeError, wipe the whole cache and retry once.
+    """
+    import shutil
+    _sanitize_cache_dir(cache_dir)
+    try:
+        return dbdreader.MultiDBD(filenames=filenames, cacheDir=cache_dir)
+    except UnicodeDecodeError:
+        # Nuclear option: wipe the entire cache and let dbdreader rebuild it
+        print(f"  WARNING: UnicodeDecodeError in cache — wiping {cache_dir} and retrying")
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        return dbdreader.MultiDBD(filenames=filenames, cacheDir=cache_dir)
+
+
 def _filter_files_by_cache(pattern, cache_dir):
     """
     Return only the files whose cache entry exists in cache_dir.
-    On first run (cache empty), returns all files so dbdreader builds the cache.
-    On subsequent runs, skips files whose .cac is missing to avoid DbdError.
+    dbdreader raises DbdError if ANY file in the pattern is missing a cache entry,
+    so we pre-filter to avoid crashing on mixed .dbd/.dcd folders where the server
+    cache only covers one file type.
     """
+    import struct
+
     files = sorted(glob.glob(pattern))
     if not files:
         return files
 
-    # If cache is empty (first run), let dbdreader build it
-    cac_files = glob.glob(os.path.join(cache_dir, "*.cac"))
-    if not cac_files:
-        return files
-
+    # Read the 8-char cache key from byte offset 16 of each binary file header.
+    # dbdreader uses this key to look up the matching .cac file.
     good_files = []
     skipped = 0
     for fpath in files:
         try:
             with open(fpath, "rb") as fh:
                 header = fh.read(200).decode("ascii", errors="replace")
+            # The sensor list CRC (cache key) appears after "sensor_list_crc:"
             key = None
             for line in header.splitlines():
                 if "sensor_list_crc:" in line.lower():
@@ -113,7 +153,7 @@ def _filter_files_by_cache(pattern, cache_dir):
             else:
                 skipped += 1
         except Exception:
-            good_files.append(fpath)
+            good_files.append(fpath)  # let dbdreader handle it
 
     if skipped > 0:
         print(f"  WARNING: skipped {skipped} files with missing cache entries "
@@ -122,15 +162,18 @@ def _filter_files_by_cache(pattern, cache_dir):
 
 
 def read_flight(data_dir, cache_dir):
+    # Accept both .dcd (compressed) and .dbd (full-res) flight files
     dcd_files = glob.glob(os.path.join(data_dir, "*.[dD][cC][dD]"))
     dbd_files = glob.glob(os.path.join(data_dir, "*.[dD][bB][dD]"))
     all_flight = dcd_files + dbd_files
-    print(f"  Flight files: {len(dcd_files)} .dcd, {len(dbd_files)} .dbd")
+    print(f"  Reading {len(all_flight)} flight files "
+          f"({len(dcd_files)} .dcd, {len(dbd_files)} .dbd)...")
 
     if not all_flight:
         print("  WARNING: no flight files found")
         return {}
 
+    # Filter to files whose cache entry exists — avoids crashing on mixed folders
     dcd_ok = _filter_files_by_cache(
         os.path.join(data_dir, "*.[dD][cC][dD]"), cache_dir)
     dbd_ok = _filter_files_by_cache(
@@ -143,13 +186,18 @@ def read_flight(data_dir, cache_dir):
         return {}
 
     try:
-        mdb = dbdreader.MultiDBD(filenames=usable, cacheDir=cache_dir)
-    except Exception:
+        mdb = _open_multidbd(usable, cache_dir)
+    except Exception as e:
+        # Fallback: try dcd-only
         if dcd_ok:
-            print("  Falling back to .dcd files (no cache)")
-            mdb = dbdreader.MultiDBD(filenames=dcd_ok)
+            print(f"  Falling back to .dcd files only ({e})")
+            try:
+                mdb = _open_multidbd(dcd_ok, cache_dir)
+            except Exception as e2:
+                print(f"  ERROR: could not open any flight files: {e2}")
+                return {}
         else:
-            print("  ERROR: could not open any flight files")
+            print(f"  ERROR: could not open any flight files: {e}")
             return {}
 
     available = get_all_params(mdb)
@@ -175,10 +223,12 @@ def read_flight(data_dir, cache_dir):
 
 
 def read_science(data_dir, cache_dir):
+    # Accept both .ecd (compressed) and .ebd (full-res) science files
     ecd_files = glob.glob(os.path.join(data_dir, "*.[eE][cC][dD]"))
     ebd_files = glob.glob(os.path.join(data_dir, "*.[eE][bB][dD]"))
     all_sci = ecd_files + ebd_files
-    print(f"  Science files: {len(ecd_files)} .ecd, {len(ebd_files)} .ebd")
+    print(f"  Reading {len(all_sci)} science files "
+          f"({len(ecd_files)} .ecd, {len(ebd_files)} .ebd)...")
 
     if not all_sci:
         print("  WARNING: no science files found")
@@ -196,13 +246,17 @@ def read_science(data_dir, cache_dir):
         return {}
 
     try:
-        mec = dbdreader.MultiDBD(filenames=usable, cacheDir=cache_dir)
-    except Exception:
+        mec = _open_multidbd(usable, cache_dir)
+    except Exception as e:
         if ecd_ok:
-            print("  Falling back to .ecd files (no cache)")
-            mec = dbdreader.MultiDBD(filenames=ecd_ok)
+            print(f"  Falling back to .ecd files only ({e})")
+            try:
+                mec = _open_multidbd(ecd_ok, cache_dir)
+            except Exception as e2:
+                print(f"  ERROR: could not open any science files: {e2}")
+                return {}
         else:
-            print("  ERROR: could not open any science files")
+            print(f"  ERROR: could not open any science files: {e}")
             return {}
 
     available = get_all_params(mec)
@@ -230,7 +284,6 @@ def read_science(data_dir, cache_dir):
 
 def filter_gps(flight):
     print("  Filtering GPS data...")
-    lat_min, lat_max, lon_min, lon_max = _gps_bounds()
     for var in ["m_lat", "m_lon", "c_wpt_lat", "c_wpt_lon"]:
         if var not in flight:
             continue
@@ -241,13 +294,13 @@ def filter_gps(flight):
         good &= np.abs(v) < (90 if "lat" in var else 180)
 
         if var == "m_lat":
-            good &= (v >= lat_min) & (v <= lat_max)
+            good &= (v >= GPS_LAT_MIN) & (v <= GPS_LAT_MAX)
         elif var == "m_lon":
-            good &= (v >= lon_min) & (v <= lon_max)
+            good &= (v >= GPS_LON_MIN) & (v <= GPS_LON_MAX)
         elif var == "c_wpt_lat":
-            good &= (v >= lat_min - 5) & (v <= lat_max + 5)
+            good &= (v >= GPS_LAT_MIN - 5) & (v <= GPS_LAT_MAX + 5)
         elif var == "c_wpt_lon":
-            good &= (v >= lon_min - 5) & (v <= lon_max + 5)
+            good &= (v >= GPS_LON_MIN - 5) & (v <= GPS_LON_MAX + 5)
 
         flight[var] = (t[good], v[good])
         n_removed = n_before - len(v[good])
@@ -267,7 +320,7 @@ def filter_science(science):
 
     if "sci_water_cond" in science:
         t, v = science["sci_water_cond"]
-        good = (v >= COND_MIN) & (v <= COND_MAX)
+        good = (v >= COND_MIN) & (v < 10.0)
         science["sci_water_cond"] = (t[good], v[good])
         print(f"  conductivity: removed {len(v) - np.sum(good)} out-of-range")
 
@@ -369,53 +422,37 @@ def detect_profiles(synced):
     t = synced["time"]
     p = synced["pressure_dbar"].copy()
     valid = np.isfinite(p)
-    if np.sum(valid) < 10:
+    if np.sum(valid) < 100:
         print("  SKIP: too few pressure points")
         return synced
 
-    # Use time gaps for sparse data (median spacing > 1 hour)
-    median_dt = float(np.median(np.diff(t)))
-    gap_threshold = max(7200, PROFILE_MIN_SECS)  # 2 hours minimum
-    time_gaps = np.diff(t)
+    p_filled = p.copy()
+    p_filled[~valid] = np.interp(t[~valid], t[valid], p[valid])
 
-    if median_dt > 600:
-        # Sparse data: split at large time gaps (each gap >= 2h starts a new profile)
-        print(f"  Sparse data (dt~{median_dt:.0f}s), splitting at gaps >= {gap_threshold}s")
-        idx = np.zeros(len(t), dtype=int)
-        cur = 0
-        seg_start = 0
-        for i in range(1, len(t)):
-            if time_gaps[i - 1] >= gap_threshold and (t[i] - t[seg_start]) >= PROFILE_MIN_SECS:
+    dt = float(np.median(np.diff(t)))
+    n_smooth = max(1, int(PROFILE_FILT_SECS / max(dt, 0.1)))
+    n_smooth = min(n_smooth, len(p_filled) // 2)
+    if n_smooth > 1:
+        kernel = np.ones(n_smooth) / n_smooth
+        p_smooth = np.convolve(p_filled, kernel, mode="same")
+    else:
+        p_smooth = p_filled
+
+    dp = np.gradient(p_smooth, t)
+    direction = np.sign(dp)
+
+    idx = np.zeros(len(t), dtype=int)
+    cur = 0
+    seg_start = 0
+    for i in range(1, len(direction)):
+        if direction[i] != direction[i - 1] and direction[i] != 0:
+            if (t[i] - t[seg_start]) >= PROFILE_MIN_SECS:
                 cur += 1
                 seg_start = i
-            idx[i] = cur
-    else:
-        # Well-sampled data: use pressure gradient direction
-        p_filled = p.copy()
-        p_filled[~valid] = np.interp(t[~valid], t[valid], p[valid])
-
-        n_smooth = max(1, int(PROFILE_FILT_SECS / max(median_dt, 0.1)))
-        n_smooth = min(n_smooth, len(p_filled) // 2)
-        if n_smooth > 1:
-            kernel = np.ones(n_smooth) / n_smooth
-            p_smooth = np.convolve(p_filled, kernel, mode="same")
-        else:
-            p_smooth = p_filled
-
-        dp = np.gradient(p_smooth, t)
-        direction = np.sign(dp)
-
-        idx = np.zeros(len(t), dtype=int)
-        cur = 0
-        seg_start = 0
-        for i in range(1, len(direction)):
-            if direction[i] != direction[i - 1] and direction[i] != 0:
-                if (t[i] - t[seg_start]) >= PROFILE_MIN_SECS:
-                    cur += 1
-                    seg_start = i
-            idx[i] = cur
+        idx[i] = cur
 
     synced["profile_index"] = idx.astype(float)
+    synced["profile_direction"] = direction
     print(f"  {len(np.unique(idx))} profiles detected")
     return synced
 
