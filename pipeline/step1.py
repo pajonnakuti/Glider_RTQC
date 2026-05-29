@@ -71,13 +71,7 @@ def load_config(yaml_path):
 
 
 def _sanitize_cache_dir(cache_dir):
-    """
-    Remove any .cac files that contain non-ASCII bytes.
-    dbdreader's read_cache does a hard .decode('ascii') with no error handling,
-    so a single corrupted .cac file (e.g. with Latin-1 sensor names) will crash
-    the entire MultiDBD open. We pre-screen and delete bad files so dbdreader
-    can rebuild them cleanly.
-    """
+    """Remove .cac files containing non-ASCII bytes (dbdreader can't read them)."""
     if not os.path.isdir(cache_dir):
         return
     removed = 0
@@ -87,8 +81,7 @@ def _sanitize_cache_dir(cache_dir):
         fp = os.path.join(cache_dir, fn)
         try:
             with open(fp, "rb") as fh:
-                data = fh.read()
-            data.decode("ascii")          # will raise if non-ASCII
+                fh.read().decode("ascii")
         except (UnicodeDecodeError, OSError):
             try:
                 os.remove(fp)
@@ -101,44 +94,76 @@ def _sanitize_cache_dir(cache_dir):
 
 def _open_multidbd(filenames, cache_dir):
     """
-    Open a dbdreader.MultiDBD, sanitizing the cache dir first.
-    If it still fails with UnicodeDecodeError, wipe the whole cache and retry once.
+    Open a dbdreader.MultiDBD robustly.
+
+    Strategy:
+      1. Sanitize cache dir (remove non-ASCII .cac files).
+      2. Try opening all files at once (fast path).
+      3. If UnicodeDecodeError → fall back to file-by-file, skipping bad files.
+         This handles Slocum binaries with non-ASCII sensor names (e.g. byte
+         0xe9 from French/Latin-1 characters in the sensor list).
     """
-    import shutil
+    os.makedirs(cache_dir, exist_ok=True)
     _sanitize_cache_dir(cache_dir)
+
+    if not filenames:
+        raise RuntimeError("No files provided")
+
+    # Fast path: try all at once
     try:
         return dbdreader.MultiDBD(filenames=filenames, cacheDir=cache_dir)
     except UnicodeDecodeError:
-        # Nuclear option: wipe the entire cache and let dbdreader rebuild it
-        print(f"  WARNING: UnicodeDecodeError in cache — wiping {cache_dir} and retrying")
-        if os.path.isdir(cache_dir):
-            shutil.rmtree(cache_dir)
-        os.makedirs(cache_dir, exist_ok=True)
-        return dbdreader.MultiDBD(filenames=filenames, cacheDir=cache_dir)
+        pass   # fall through to file-by-file
+    except Exception:
+        raise
+
+    # Slow path: load one file at a time, skip non-ASCII ones
+    print(f"  Batch open failed (non-ASCII sensor names) — "
+          f"trying {len(filenames)} files one-by-one...")
+    good_files = []
+    bad = 0
+    for fpath in filenames:
+        try:
+            tmp = dbdreader.MultiDBD(filenames=[fpath], cacheDir=cache_dir)
+            tmp.close()
+            good_files.append(fpath)
+        except UnicodeDecodeError:
+            bad += 1
+        except Exception:
+            # Other errors (missing cache, truncated file) — include anyway,
+            # the batch open will handle or skip them
+            good_files.append(fpath)
+
+    if bad:
+        print(f"  Skipped {bad} file(s) with non-ASCII sensor names")
+    if not good_files:
+        raise RuntimeError("No files with ASCII-compatible sensor names found")
+
+    print(f"  Loaded {len(good_files)}/{len(filenames)} files successfully")
+    return dbdreader.MultiDBD(filenames=good_files, cacheDir=cache_dir)
 
 
 def _filter_files_by_cache(pattern, cache_dir):
     """
-    Return only the files whose cache entry exists in cache_dir.
-    dbdreader raises DbdError if ANY file in the pattern is missing a cache entry,
-    so we pre-filter to avoid crashing on mixed .dbd/.dcd folders where the server
-    cache only covers one file type.
+    Return files matching pattern. On first run (empty cache), returns all files
+    so dbdreader can build the cache. The ASCII safety check is handled by
+    _filter_ascii_files inside _open_multidbd.
     """
-    import struct
-
     files = sorted(glob.glob(pattern))
     if not files:
         return files
 
-    # Read the 8-char cache key from byte offset 16 of each binary file header.
-    # dbdreader uses this key to look up the matching .cac file.
+    # If cache is populated, only return files whose .cac exists
+    cac_files = glob.glob(os.path.join(cache_dir, "*.cac"))
+    if not cac_files:
+        return files   # first run — return all, let _open_multidbd filter
+
     good_files = []
     skipped = 0
     for fpath in files:
         try:
             with open(fpath, "rb") as fh:
-                header = fh.read(200).decode("ascii", errors="replace")
-            # The sensor list CRC (cache key) appears after "sensor_list_crc:"
+                header = fh.read(300).decode("ascii", errors="replace")
             key = None
             for line in header.splitlines():
                 if "sensor_list_crc:" in line.lower():
@@ -153,11 +178,10 @@ def _filter_files_by_cache(pattern, cache_dir):
             else:
                 skipped += 1
         except Exception:
-            good_files.append(fpath)  # let dbdreader handle it
+            good_files.append(fpath)
 
     if skipped > 0:
-        print(f"  WARNING: skipped {skipped} files with missing cache entries "
-              f"(copy matching .cac files to {cache_dir} to include them)")
+        print(f"  WARNING: skipped {skipped} files with missing cache entries")
     return good_files
 
 
@@ -188,17 +212,8 @@ def read_flight(data_dir, cache_dir):
     try:
         mdb = _open_multidbd(usable, cache_dir)
     except Exception as e:
-        # Fallback: try dcd-only
-        if dcd_ok:
-            print(f"  Falling back to .dcd files only ({e})")
-            try:
-                mdb = _open_multidbd(dcd_ok, cache_dir)
-            except Exception as e2:
-                print(f"  ERROR: could not open any flight files: {e2}")
-                return {}
-        else:
-            print(f"  ERROR: could not open any flight files: {e}")
-            return {}
+        print(f"  ERROR: could not open any flight files: {e}")
+        return {}
 
     available = get_all_params(mdb)
     print(f"  {len(available)} parameters available")
@@ -248,16 +263,8 @@ def read_science(data_dir, cache_dir):
     try:
         mec = _open_multidbd(usable, cache_dir)
     except Exception as e:
-        if ecd_ok:
-            print(f"  Falling back to .ecd files only ({e})")
-            try:
-                mec = _open_multidbd(ecd_ok, cache_dir)
-            except Exception as e2:
-                print(f"  ERROR: could not open any science files: {e2}")
-                return {}
-        else:
-            print(f"  ERROR: could not open any science files: {e}")
-            return {}
+        print(f"  ERROR: could not open any science files: {e}")
+        return {}
 
     available = get_all_params(mec)
     print(f"  {len(available)} parameters available")
