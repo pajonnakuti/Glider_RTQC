@@ -61,6 +61,19 @@ def run_step4(l1_path=None):
 
     base_name = f"incois_glider_{GLIDER_ID}"
 
+    # Build a per-variable QC mask over the full dataset once.
+    # Values with QC flag 3 (probably bad) or 4 (bad) are excluded from gridding.
+    # Flag 1 (good) and 2 (probably good) are kept.
+    # If no QC variable exists for a given variable, all finite values are used.
+    def _qc_good_mask(ds, var):
+        qc_var = f"{var}_QC"
+        if qc_var in ds:
+            qc = ds[qc_var].values.astype(int)
+            return (qc == 1) | (qc == 2)
+        return np.ones(len(ds.time), dtype=bool)
+
+    qc_masks = {var: _qc_good_mask(ds, var) for var in vars_to_grid if var in ds}
+
     for i, p_num in enumerate(unique_profiles):
         prof_mask = (ds.profile_index == p_num)
         prof_ds = ds.isel(time=prof_mask)
@@ -77,10 +90,18 @@ def run_step4(l1_path=None):
         profile_times.append(p_time)
 
         d_vals = prof_ds.depth.values
+        # Profile-level QC mask (slice of the full-dataset mask)
+        prof_indices = np.where(prof_mask.values)[0]
+
         for var in vars_to_grid:
             if var in prof_ds:
                 v_vals = prof_ds[var].values
-                valid = np.isfinite(d_vals) & np.isfinite(v_vals)
+                # Apply QC: only use good/probably-good flagged points
+                if var in qc_masks:
+                    qc_ok = qc_masks[var][prof_indices]
+                else:
+                    qc_ok = np.ones(len(v_vals), dtype=bool)
+                valid = np.isfinite(d_vals) & np.isfinite(v_vals) & qc_ok
                 if np.sum(valid) > 0:
                     stat, _, _ = binned_statistic(d_vals[valid], v_vals[valid], statistic="mean", bins=depth_bins)
                     gridded_data[var].append(stat)
@@ -105,8 +126,8 @@ def run_step4(l1_path=None):
             grid_ds[var] = xr.DataArray(grid_data_array, dims=["time", "depth"], attrs=attrs)
 
     grid_ds.attrs = ds.attrs.copy()
-    grid_ds.attrs["processing_level"] = ds.attrs.get("processing_level", "") + " | 2D Gridded"
-    grid_ds.attrs["note"] = f"Binned to {DEPTH_BIN}m depth bins, 1 profile per time step"
+    grid_ds.attrs["processing_level"] = ds.attrs.get("processing_level", "") + " | 2D Gridded (QC flags 1&2 only)"
+    grid_ds.attrs["note"] = f"Binned to {DEPTH_BIN}m depth bins, 1 profile per time step. Only QC flag 1 (good) and 2 (probably good) values included."
 
     grid_out = os.path.join(grid_dir, f"{base_name}_grid.nc")
     grid_ds.to_netcdf(grid_out, mode="w")

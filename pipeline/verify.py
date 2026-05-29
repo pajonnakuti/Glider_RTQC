@@ -2,7 +2,6 @@
 """
 verify.py — L1 product diagnostics and verification.
 
-Checks for the issues your guide flagged:
   1. GPS track anomalies (gaps, jumps, wrong locations)
   2. T-S diagram problems (out-of-range, over-smoothed, spikes)
   3. QC flag inconsistencies (temp_QC vs salinity_QC, pressure cascade)
@@ -72,7 +71,7 @@ def check_gps(ds):
             valid_idx = np.where(valid)[0]
             prof_at_valid = profile_index[valid_idx]
             same_prof = np.diff(prof_at_valid) == 0
-            within_prof_jumps = dist[:-1][same_prof] if len(same_prof) == len(dist) - 1 else dist
+            within_prof_jumps = dist[same_prof] if len(same_prof) == len(dist) else dist
             big_jumps = int(np.sum(within_prof_jumps > 50))
             if big_jumps > 0:
                 issues.append(f"WARNING: {big_jumps} GPS jumps >50km WITHIN same profile")
@@ -270,7 +269,7 @@ def compare_l0_l1(l1_path, l0_path):
     print("=" * 70)
 
     issues = []
-    if not os.path.exists(l0_path):
+    if l0_path is None or not os.path.exists(l0_path):
         print(f"\n  L0 file not found: {l0_path}")
         print("  Skipping L0 vs L1 comparison")
         return issues
@@ -285,6 +284,14 @@ def compare_l0_l1(l1_path, l0_path):
     if n0 != n1:
         issues.append(f"WARNING: L0 has {n0:,} points but L1 has {n1:,} points (difference: {n1-n0:+,})")
         print(f"  Difference: {n1-n0:+,}")
+        ds0, ds1 = xr.align(ds0, ds1, join="inner")
+        n_aligned = len(ds0.time)
+        print(f"  Aligned on common time: {n_aligned:,} points")
+        if n_aligned == 0:
+            ds0.close()
+            ds1.close()
+            issues.append("CRITICAL: No common time points between L0 and L1")
+            return issues
 
     for var in ['temperature', 'salinity', 'pressure', 'chlorophyll', 'cdom', 'backscatter_700', 'oxygen_concentration']:
         if var not in ds0 or var not in ds1:

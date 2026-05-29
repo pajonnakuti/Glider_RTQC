@@ -14,12 +14,20 @@ from scipy.interpolate import interp1d
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config
 from config import (
-    BINARY_DIR, CACHE_DIR, DEPLOY_YAML, OUTPUT_DIR,
-    GPS_LAT_MIN, GPS_LAT_MAX, GPS_LON_MIN, GPS_LON_MAX,
+    BINARY_DIR, CACHE_DIR, DEPLOY_YAML, OUTPUT_DIR, GLIDER_ID,
     TEMP_MIN, TEMP_MAX, COND_MIN, PRES_MIN,
-    PROFILE_FILT_SECS, PROFILE_MIN_SECS, GLIDER_ID,
+    PROFILE_FILT_SECS, PROFILE_MIN_SECS,
 )
+
+COND_MAX = 15.0
+
+
+def _gps_bounds():
+    """Read GPS bounds from config at call time (detect_deployment may update them)."""
+    return (config.GPS_LAT_MIN, config.GPS_LAT_MAX,
+            config.GPS_LON_MIN, config.GPS_LON_MAX)
 
 try:
     import gsw
@@ -70,12 +78,80 @@ def load_config(yaml_path):
     return config
 
 
-def read_flight(data_dir, cache_dir):
-    pattern = os.path.join(data_dir, "*.[dD][cC][dD]")
-    n_files = len(glob.glob(pattern))
-    print(f"  Reading {n_files} .dcd (flight) files...")
+def _filter_files_by_cache(pattern, cache_dir):
+    """
+    Return only the files whose cache entry exists in cache_dir.
+    On first run (cache empty), returns all files so dbdreader builds the cache.
+    On subsequent runs, skips files whose .cac is missing to avoid DbdError.
+    """
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return files
 
-    mdb = dbdreader.MultiDBD(pattern=pattern, cacheDir=cache_dir)
+    # If cache is empty (first run), let dbdreader build it
+    cac_files = glob.glob(os.path.join(cache_dir, "*.cac"))
+    if not cac_files:
+        return files
+
+    good_files = []
+    skipped = 0
+    for fpath in files:
+        try:
+            with open(fpath, "rb") as fh:
+                header = fh.read(200).decode("ascii", errors="replace")
+            key = None
+            for line in header.splitlines():
+                if "sensor_list_crc:" in line.lower():
+                    key = line.split(":")[-1].strip().lower()
+                    break
+            if key is None:
+                good_files.append(fpath)
+                continue
+            cac_path = os.path.join(cache_dir, key + ".cac")
+            if os.path.exists(cac_path):
+                good_files.append(fpath)
+            else:
+                skipped += 1
+        except Exception:
+            good_files.append(fpath)
+
+    if skipped > 0:
+        print(f"  WARNING: skipped {skipped} files with missing cache entries "
+              f"(copy matching .cac files to {cache_dir} to include them)")
+    return good_files
+
+
+def read_flight(data_dir, cache_dir):
+    dcd_files = glob.glob(os.path.join(data_dir, "*.[dD][cC][dD]"))
+    dbd_files = glob.glob(os.path.join(data_dir, "*.[dD][bB][dD]"))
+    all_flight = dcd_files + dbd_files
+    print(f"  Flight files: {len(dcd_files)} .dcd, {len(dbd_files)} .dbd")
+
+    if not all_flight:
+        print("  WARNING: no flight files found")
+        return {}
+
+    dcd_ok = _filter_files_by_cache(
+        os.path.join(data_dir, "*.[dD][cC][dD]"), cache_dir)
+    dbd_ok = _filter_files_by_cache(
+        os.path.join(data_dir, "*.[dD][bB][dD]"), cache_dir)
+    usable = dcd_ok + dbd_ok
+    if len(usable) < len(all_flight):
+        print(f"  Using {len(usable)}/{len(all_flight)} flight files (rest missing cache)")
+    if not usable:
+        print("  ERROR: no usable flight files after cache check")
+        return {}
+
+    try:
+        mdb = dbdreader.MultiDBD(filenames=usable, cacheDir=cache_dir)
+    except Exception:
+        if dcd_ok:
+            print("  Falling back to .dcd files (no cache)")
+            mdb = dbdreader.MultiDBD(filenames=dcd_ok)
+        else:
+            print("  ERROR: could not open any flight files")
+            return {}
+
     available = get_all_params(mdb)
     print(f"  {len(available)} parameters available")
 
@@ -99,11 +175,36 @@ def read_flight(data_dir, cache_dir):
 
 
 def read_science(data_dir, cache_dir):
-    pattern = os.path.join(data_dir, "*.[eE][cC][dD]")
-    n_files = len(glob.glob(pattern))
-    print(f"  Reading {n_files} .ecd (science) files...")
+    ecd_files = glob.glob(os.path.join(data_dir, "*.[eE][cC][dD]"))
+    ebd_files = glob.glob(os.path.join(data_dir, "*.[eE][bB][dD]"))
+    all_sci = ecd_files + ebd_files
+    print(f"  Science files: {len(ecd_files)} .ecd, {len(ebd_files)} .ebd")
 
-    mec = dbdreader.MultiDBD(pattern=pattern, cacheDir=cache_dir)
+    if not all_sci:
+        print("  WARNING: no science files found")
+        return {}
+
+    ecd_ok = _filter_files_by_cache(
+        os.path.join(data_dir, "*.[eE][cC][dD]"), cache_dir)
+    ebd_ok = _filter_files_by_cache(
+        os.path.join(data_dir, "*.[eE][bB][dD]"), cache_dir)
+    usable = ecd_ok + ebd_ok
+    if len(usable) < len(all_sci):
+        print(f"  Using {len(usable)}/{len(all_sci)} science files (rest missing cache)")
+    if not usable:
+        print("  ERROR: no usable science files after cache check")
+        return {}
+
+    try:
+        mec = dbdreader.MultiDBD(filenames=usable, cacheDir=cache_dir)
+    except Exception:
+        if ecd_ok:
+            print("  Falling back to .ecd files (no cache)")
+            mec = dbdreader.MultiDBD(filenames=ecd_ok)
+        else:
+            print("  ERROR: could not open any science files")
+            return {}
+
     available = get_all_params(mec)
     print(f"  {len(available)} parameters available")
 
@@ -129,6 +230,7 @@ def read_science(data_dir, cache_dir):
 
 def filter_gps(flight):
     print("  Filtering GPS data...")
+    lat_min, lat_max, lon_min, lon_max = _gps_bounds()
     for var in ["m_lat", "m_lon", "c_wpt_lat", "c_wpt_lon"]:
         if var not in flight:
             continue
@@ -139,13 +241,13 @@ def filter_gps(flight):
         good &= np.abs(v) < (90 if "lat" in var else 180)
 
         if var == "m_lat":
-            good &= (v >= GPS_LAT_MIN) & (v <= GPS_LAT_MAX)
+            good &= (v >= lat_min) & (v <= lat_max)
         elif var == "m_lon":
-            good &= (v >= GPS_LON_MIN) & (v <= GPS_LON_MAX)
+            good &= (v >= lon_min) & (v <= lon_max)
         elif var == "c_wpt_lat":
-            good &= (v >= GPS_LAT_MIN - 5) & (v <= GPS_LAT_MAX + 5)
+            good &= (v >= lat_min - 5) & (v <= lat_max + 5)
         elif var == "c_wpt_lon":
-            good &= (v >= GPS_LON_MIN - 5) & (v <= GPS_LON_MAX + 5)
+            good &= (v >= lon_min - 5) & (v <= lon_max + 5)
 
         flight[var] = (t[good], v[good])
         n_removed = n_before - len(v[good])
@@ -165,7 +267,7 @@ def filter_science(science):
 
     if "sci_water_cond" in science:
         t, v = science["sci_water_cond"]
-        good = (v >= COND_MIN) & (v < 10.0)
+        good = (v >= COND_MIN) & (v <= COND_MAX)
         science["sci_water_cond"] = (t[good], v[good])
         print(f"  conductivity: removed {len(v) - np.sum(good)} out-of-range")
 
@@ -267,37 +369,53 @@ def detect_profiles(synced):
     t = synced["time"]
     p = synced["pressure_dbar"].copy()
     valid = np.isfinite(p)
-    if np.sum(valid) < 100:
+    if np.sum(valid) < 10:
         print("  SKIP: too few pressure points")
         return synced
 
-    p_filled = p.copy()
-    p_filled[~valid] = np.interp(t[~valid], t[valid], p[valid])
+    # Use time gaps for sparse data (median spacing > 1 hour)
+    median_dt = float(np.median(np.diff(t)))
+    gap_threshold = max(7200, PROFILE_MIN_SECS)  # 2 hours minimum
+    time_gaps = np.diff(t)
 
-    dt = float(np.median(np.diff(t)))
-    n_smooth = max(1, int(PROFILE_FILT_SECS / max(dt, 0.1)))
-    n_smooth = min(n_smooth, len(p_filled) // 2)
-    if n_smooth > 1:
-        kernel = np.ones(n_smooth) / n_smooth
-        p_smooth = np.convolve(p_filled, kernel, mode="same")
-    else:
-        p_smooth = p_filled
-
-    dp = np.gradient(p_smooth, t)
-    direction = np.sign(dp)
-
-    idx = np.zeros(len(t), dtype=int)
-    cur = 0
-    seg_start = 0
-    for i in range(1, len(direction)):
-        if direction[i] != direction[i - 1] and direction[i] != 0:
-            if (t[i] - t[seg_start]) >= PROFILE_MIN_SECS:
+    if median_dt > 600:
+        # Sparse data: split at large time gaps (each gap >= 2h starts a new profile)
+        print(f"  Sparse data (dt~{median_dt:.0f}s), splitting at gaps >= {gap_threshold}s")
+        idx = np.zeros(len(t), dtype=int)
+        cur = 0
+        seg_start = 0
+        for i in range(1, len(t)):
+            if time_gaps[i - 1] >= gap_threshold and (t[i] - t[seg_start]) >= PROFILE_MIN_SECS:
                 cur += 1
                 seg_start = i
-        idx[i] = cur
+            idx[i] = cur
+    else:
+        # Well-sampled data: use pressure gradient direction
+        p_filled = p.copy()
+        p_filled[~valid] = np.interp(t[~valid], t[valid], p[valid])
+
+        n_smooth = max(1, int(PROFILE_FILT_SECS / max(median_dt, 0.1)))
+        n_smooth = min(n_smooth, len(p_filled) // 2)
+        if n_smooth > 1:
+            kernel = np.ones(n_smooth) / n_smooth
+            p_smooth = np.convolve(p_filled, kernel, mode="same")
+        else:
+            p_smooth = p_filled
+
+        dp = np.gradient(p_smooth, t)
+        direction = np.sign(dp)
+
+        idx = np.zeros(len(t), dtype=int)
+        cur = 0
+        seg_start = 0
+        for i in range(1, len(direction)):
+            if direction[i] != direction[i - 1] and direction[i] != 0:
+                if (t[i] - t[seg_start]) >= PROFILE_MIN_SECS:
+                    cur += 1
+                    seg_start = i
+            idx[i] = cur
 
     synced["profile_index"] = idx.astype(float)
-    synced["profile_direction"] = direction
     print(f"  {len(np.unique(idx))} profiles detected")
     return synced
 

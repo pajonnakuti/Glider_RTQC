@@ -14,12 +14,12 @@ from scipy.signal import savgol_filter
 from scipy.ndimage import median_filter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import (
-    OUTPUT_DIR, GLIDER_ID, MAX_DEPTH_DBAR, OXYGEN_TAU,
-    CLEAN_FACTORY_TESTS, FACTORY_LAT_MIN, FACTORY_LAT_MAX,
-    FACTORY_LON_MIN, FACTORY_LON_MAX, CLEAN_ZERO_GPS,
-    CLEAN_HEMISPHERE, CLEAN_MODE_YEAR,
-)
+import config
+from config import OUTPUT_DIR, GLIDER_ID, MAX_DEPTH_DBAR, OXYGEN_TAU
+
+PHYS_TEMP_MIN, PHYS_TEMP_MAX = -2.5, 40.0
+PHYS_SAL_MIN, PHYS_SAL_MAX = 2.0, 41.0
+PHYS_OXY_MIN, PHYS_OXY_MAX = -5.0, 600.0
 
 try:
     import gsw
@@ -40,49 +40,61 @@ except ImportError:
 
 def pre_clean(ds):
     """Remove pre-deployment factory tests, zero GPS, and cross-hemisphere data."""
+    # Read from config at call time so detect_deployment() values are used
+    clean_factory  = config.CLEAN_FACTORY_TESTS
+    fact_lat_min   = config.FACTORY_LAT_MIN
+    fact_lat_max   = config.FACTORY_LAT_MAX
+    fact_lon_min   = config.FACTORY_LON_MIN
+    fact_lon_max   = config.FACTORY_LON_MAX
+    clean_zero     = config.CLEAN_ZERO_GPS
+    clean_hemi     = config.CLEAN_HEMISPHERE
+    clean_year     = config.CLEAN_MODE_YEAR
+
     n_orig = len(ds.time)
 
     if "latitude" in ds and "longitude" in ds:
-        if CLEAN_FACTORY_TESTS:
-            mask = ~((ds.latitude > FACTORY_LAT_MIN) & (ds.latitude < FACTORY_LAT_MAX)
-                     & (ds.longitude > FACTORY_LON_MIN) & (ds.longitude < FACTORY_LON_MAX))
+        if clean_factory:
+            mask = ~((ds.latitude > fact_lat_min) & (ds.latitude < fact_lat_max)
+                     & (ds.longitude > fact_lon_min) & (ds.longitude < fact_lon_max))
             ds = ds.where(mask, drop=True)
 
-        if CLEAN_ZERO_GPS:
+        if clean_zero:
             ds = ds.where(~((ds.latitude == 0) & (ds.longitude == 0)), drop=True)
 
     if "waypoint_latitude" in ds and "waypoint_longitude" in ds:
-        if CLEAN_FACTORY_TESTS:
-            wp_mask = ~((ds["waypoint_latitude"] > FACTORY_LAT_MIN)
-                        & (ds["waypoint_latitude"] < FACTORY_LAT_MAX)
-                        & (ds["waypoint_longitude"] > FACTORY_LON_MIN)
-                        & (ds["waypoint_longitude"] < FACTORY_LON_MAX))
-            ds["waypoint_latitude"] = ds["waypoint_latitude"].where(wp_mask)
+        if clean_factory:
+            wp_mask = ~((ds["waypoint_latitude"] > fact_lat_min)
+                        & (ds["waypoint_latitude"] < fact_lat_max)
+                        & (ds["waypoint_longitude"] > fact_lon_min)
+                        & (ds["waypoint_longitude"] < fact_lon_max))
+            ds["waypoint_latitude"]  = ds["waypoint_latitude"].where(wp_mask)
             ds["waypoint_longitude"] = ds["waypoint_longitude"].where(wp_mask)
 
     ds = ds.sortby("time")
 
-    if CLEAN_MODE_YEAR and HAS_PANDAS:
+    if clean_year and HAS_PANDAS:
         t_dt = pd.Series(ds.time.values)
         if len(t_dt) > 0:
             mode_year = t_dt.dt.year.mode()[0]
-            ds = ds.sel(time=((ds.time.dt.year == mode_year) | (ds.time.dt.year == mode_year - 1)))
+            ds = ds.sel(time=((ds.time.dt.year == mode_year) |
+                              (ds.time.dt.year == mode_year - 1)))
 
-    if CLEAN_HEMISPHERE and "latitude" in ds:
+    if clean_hemi and "latitude" in ds:
         median_lat = float(np.nanmedian(ds.latitude.values))
         if median_lat < 0:
             ds = ds.where(ds.latitude < 0, drop=True)
             if "waypoint_latitude" in ds:
-                ds["waypoint_latitude"] = ds["waypoint_latitude"].where(ds["waypoint_latitude"] < 0)
+                ds["waypoint_latitude"]  = ds["waypoint_latitude"].where(ds["waypoint_latitude"] < 0)
                 ds["waypoint_longitude"] = ds["waypoint_longitude"].where(ds["waypoint_latitude"] < 0)
         else:
             ds = ds.where(ds.latitude > 0, drop=True)
             if "waypoint_latitude" in ds:
-                ds["waypoint_latitude"] = ds["waypoint_latitude"].where(ds["waypoint_latitude"] > 0)
+                ds["waypoint_latitude"]  = ds["waypoint_latitude"].where(ds["waypoint_latitude"] > 0)
                 ds["waypoint_longitude"] = ds["waypoint_longitude"].where(ds["waypoint_latitude"] > 0)
 
     n_clean = len(ds.time)
-    print(f"  Pre-cleaning: {n_orig} -> {n_clean} observations (removed {n_orig - n_clean})")
+    print(f"  Pre-cleaning: {n_orig} -> {n_clean} observations "
+          f"(removed {n_orig - n_clean})")
     return ds
 
 
@@ -120,7 +132,7 @@ def despike_median(data, window=5):
     return baseline, spikes
 
 
-def smooth_savgol_per_profile(data, profile_index, window=11, order=2):
+def smooth_savgol_per_profile(data, profile_index, window=11, order=2, depth=None):
     out = data.copy()
     valid_mask = np.isfinite(data) & np.isfinite(profile_index)
     if np.sum(valid_mask) < window:
@@ -128,18 +140,27 @@ def smooth_savgol_per_profile(data, profile_index, window=11, order=2):
     profiles = np.unique(profile_index[valid_mask])
     for p in profiles:
         p_mask = valid_mask & (profile_index == p)
-        p_vals = data[p_mask]
+        p_idx = np.where(p_mask)[0]
+        p_vals = data[p_idx]
         if len(p_vals) < window:
             continue
-        filled = p_vals.copy()
-        p_valid = np.isfinite(filled)
-        if np.any(~p_valid):
-            filled[~p_valid] = np.interp(
-                np.flatnonzero(~p_valid), np.flatnonzero(p_valid),
-                p_vals[p_valid], left=np.nan, right=np.nan)
+        p_valid = np.isfinite(p_vals)
+        if depth is not None:
+            p_depth = depth[p_idx]
+            depth_order = np.argsort(p_depth)
+        else:
+            depth_order = np.arange(len(p_vals))
+        p_sorted = p_vals[depth_order]
+        s_valid = p_valid[depth_order]
+        filled = p_sorted.copy()
+        if np.any(~s_valid):
+            filled[~s_valid] = np.interp(
+                np.flatnonzero(~s_valid), np.flatnonzero(s_valid),
+                p_sorted[s_valid], left=np.nan, right=np.nan)
         if len(filled) >= window:
             smoothed = savgol_filter(filled, window, order)
-            out[p_mask] = np.where(p_valid, smoothed, np.nan)
+            undo = np.argsort(depth_order)
+            out[p_idx] = np.where(p_valid, smoothed[undo], np.nan)
     return out
 
 
@@ -161,14 +182,18 @@ def backscatter_zhang_correction(beta, temperature, salinity,
     return out
 
 
-def insitu_dark_count(data, depth, deep_min=200, deep_max=400, percentile=95):
+def insitu_dark_count(data, depth, deep_min=200, deep_max=400, percentile=95,
+                      shallow_threshold=100):
     valid = np.isfinite(data) & np.isfinite(depth)
+    max_valid_depth = float(np.nanmax(depth[valid])) if np.any(valid) else 0.0
     deep = valid & (depth >= deep_min) & (depth <= deep_max)
     used_fallback = False
     if np.sum(deep) < 5:
         if np.sum(valid) < 10:
             return data, False
         depth_thresh = np.percentile(depth[valid], 90)
+        if depth_thresh < shallow_threshold:
+            return data, False
         deep = valid & (depth >= depth_thresh)
         used_fallback = True
     if np.sum(deep) < 3:
@@ -317,10 +342,11 @@ def apply_optics_correction(ds):
         chl, fb = insitu_dark_count(chl, depth)
         if fb:
             print("    WARNING: chlorophyll dark count - no deep data, using fallback")
+        chl = np.where(np.isfinite(chl), np.maximum(chl, 0.0), np.nan)  # clip negatives
         chl_base, chl_spikes = despike_median(chl, window=7)
         ds["chlorophyll"] = xr.DataArray(chl_base, dims=["time"],
             attrs={"long_name": "chlorophyll", "units": "mg m-3",
-                   "comment": "QC: IQR(3x), dark count corrected, despiked"})
+                   "comment": "QC: IQR(3x), dark count corrected, clipped to 0, despiked"})
         ds["chlorophyll_spikes"] = xr.DataArray(chl_spikes, dims=["time"],
             attrs={"long_name": "chlorophyll spikes", "units": "mg m-3"})
         print(f"    chlorophyll: IQR removed {n_iqr}, dark count corrected, despiked")
@@ -331,10 +357,11 @@ def apply_optics_correction(ds):
         cdom, fb = insitu_dark_count(cdom, depth)
         if fb:
             print("    WARNING: cdom dark count - no deep data, using fallback")
+        cdom = np.where(np.isfinite(cdom), np.maximum(cdom, 0.0), np.nan)  # clip negatives
         cdom_base, _ = despike_median(cdom, window=7)
         ds["cdom"] = xr.DataArray(cdom_base, dims=["time"],
             attrs={"long_name": "CDOM", "units": "ppb",
-                   "comment": "QC: IQR(3x), dark count corrected, despiked"})
+                   "comment": "QC: IQR(3x), dark count corrected, clipped to 0, despiked"})
         print(f"    cdom: IQR removed {n_iqr}, processed")
 
     if "backscatter_700" in ds:
@@ -393,30 +420,65 @@ def apply_optics_correction(ds):
 def apply_physics_qc(ds):
     print("  Physics QC (GliderTools-style)...")
     profile_index = ds["profile_index"].values if "profile_index" in ds else np.zeros(len(ds.time))
+    depth = ds["depth"].values if "depth" in ds else ds["pressure"].values if "pressure" in ds else None
 
-    for var, iqr_mult, sg_win in [
-        ("temperature", 1.5, 11),
-        ("salinity", 2.5, 11),
-        ("oxygen_concentration", 2.0, 11),
+    # For glider T/S/O2 we do NOT use IQR — it is fundamentally wrong for full-depth
+    # profiles where cold deep water dominates the distribution and would flag warm
+    # surface water as outliers. Instead we use:
+    #   1. Physical range limits (removes truly impossible values)
+    #   2. Median despike (removes point-to-point spikes within a profile)
+    #   3. Savitzky-Golay smoothing per profile (reduces sensor noise)
+    # IQR is reserved for optical variables (chlorophyll, backscatter) where the
+    # distribution is more uniform and global outliers are meaningful.
+
+    phys_limits = {
+        "temperature":          (PHYS_TEMP_MIN, PHYS_TEMP_MAX),
+        "salinity":             (PHYS_SAL_MIN,  PHYS_SAL_MAX),
+        "oxygen_concentration": (PHYS_OXY_MIN,  PHYS_OXY_MAX),
+    }
+
+    for var, sg_win in [
+        ("temperature",          11),
+        ("salinity",             11),
+        ("oxygen_concentration", 11),
     ]:
         if var not in ds:
             continue
         vals = ds[var].values.copy()
         n_orig = int(np.sum(np.isfinite(vals)))
-        vals, n_iqr = outlier_bounds_iqr(vals, multiplier=iqr_mult)
+
+        # Step 1: physical range guard
+        if var in phys_limits:
+            lo_phys, hi_phys = phys_limits[var]
+            n_phys = int(np.sum(np.isfinite(vals) & ((vals < lo_phys) | (vals > hi_phys))))
+            vals[(vals < lo_phys) | (vals > hi_phys)] = np.nan
+            if n_phys > 0:
+                print(f"    {var}: physical range removed {n_phys}")
+
+        # Step 2: median despike (catches point spikes, not vertical structure)
         vals, spikes = despike_median(vals, window=5)
-        vals = smooth_savgol_per_profile(vals, profile_index, window=sg_win, order=2)
+
+        # Step 3: Savitzky-Golay smoothing per profile (depth-sorted)
+        vals = smooth_savgol_per_profile(vals, profile_index, window=sg_win, order=2, depth=depth)
+
+        # Clip oxygen to physically meaningful minimum
+        if var == "oxygen_concentration":
+            vals = np.where(np.isfinite(vals), np.maximum(vals, 0.0), np.nan)
+
         attrs = dict(ds[var].attrs) if var in ds else {}
-        attrs["comment"] = f"QC: IQR({iqr_mult}x), despiked, SG smoothed per-profile (w={sg_win})"
+        attrs["comment"] = (
+            f"QC: physical range check, median despiked (w=5), "
+            f"SG smoothed per-profile (w={sg_win})"
+        )
         ds[var] = xr.DataArray(vals, dims=["time"], attrs=attrs)
         n_final = int(np.sum(np.isfinite(vals)))
-        print(f"    {var}: {n_orig} -> {n_final} valid (IQR removed {n_iqr})")
+        print(f"    {var}: {n_orig} -> {n_final} valid")
 
     if "salinity" in ds and "profile_index" in ds:
         sal_depth = ds["depth"].values if "depth" in ds else ds["pressure"].values
         sal_mask, n_hdiff = horizontal_diff_outliers(
             ds["salinity"].values, sal_depth, ds["profile_index"].values,
-            max_frac=0.1, multiplier=3.0)
+            max_frac=0.5, multiplier=6.0)
         if n_hdiff > 0:
             sal_vals = ds["salinity"].values.copy()
             sal_vals[sal_mask] = np.nan
@@ -735,7 +797,7 @@ def test_gross_sensor_drift(ds, qc_dict):
         p_curr = prof_list[i]
         if p_curr in deep_means_s and p_prev in deep_means_s:
             delta_s = abs(deep_means_s[p_curr] - deep_means_s[p_prev])
-            if delta_s > 0.5:
+            if delta_s > 1.0:   # raised from 0.5 — real horizontal salinity gradients exist
                 p_mask = (profile_index == p_curr)
                 if "salinity" in qc_dict:
                     qc_dict["salinity"][p_mask] = 3
@@ -746,7 +808,7 @@ def test_gross_sensor_drift(ds, qc_dict):
         p_curr = prof_list_t[i]
         if p_curr in deep_means_t and p_prev in deep_means_t:
             delta_t = abs(deep_means_t[p_curr] - deep_means_t[p_prev])
-            if delta_t > 1.0:
+            if delta_t > 3.0:   # raised from 1.0 — gliders cross real horizontal gradients
                 p_mask = (profile_index == p_curr)
                 if "temperature" in qc_dict:
                     qc_dict["temperature"][p_mask] = 3
