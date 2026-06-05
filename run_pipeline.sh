@@ -4,51 +4,82 @@
 #
 #  USAGE
 #  -----
-#  Basic (uses DATA_DIR set in pipeline/config.py):
-#    ./run_pipeline.sh
+#  From the SSH machine or WSL:
+#    bash run_pipeline.sh                          # uses DATA_DIR in config.py
+#    bash run_pipeline.sh /path/to/data/890_2023   # override data folder
 #
-#  Override data folder at runtime:
-#    ./run_pipeline.sh /path/to/glider_data/890_2
-#    ./run_pipeline.sh /path/to/glider_data/1126
-#
-#  Skip step 1 (binary decode) if L0 already exists:
-#    RUN_STEP1=0 ./run_pipeline.sh /path/to/glider_data/890_2
-#
-#  REQUIREMENTS
-#  ------------
-#  Python environment with:
-#    numpy, xarray, scipy, matplotlib, gsw, dbdreader, pyyaml, pandas, netCDF4
-#
-#  Install missing packages:
-#    pip install numpy xarray scipy matplotlib gsw dbdreader pyyaml pandas netCDF4
-#
-#  On Linux/Mac with conda:
-#    conda activate base
-#    ./run_pipeline.sh /data/glider/890_2
+#  The script auto-finds Python with all dependencies installed.
+#  It checks (in order):
+#    1. conda 'glider' or 'base' environment
+#    2. ~/glider_env/bin/python  (venv)
+#    3. System python3 (may lack packages)
 # ============================================================
 
 set -e
 
-# Resolve the directory this script lives in (works with symlinks too)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_DIR="$SCRIPT_DIR/pipeline"
 
-# ---- Python interpreter ----
-# Edit this line if your Python is somewhere else.
-if command -v python3 &>/dev/null; then
-    PYTHON=python3
-elif command -v python &>/dev/null; then
-    PYTHON=python
-else
-    echo "ERROR: python not found. Activate your conda/venv environment first."
-    exit 1
+# ---- Find Python with all required packages ----
+PYTHON=""
+
+# Helper: test if a python executable has all required packages
+_has_packages() {
+    local py="$1"
+    "$py" -c "import dbdreader, xarray, gsw, scipy, matplotlib, numpy, netCDF4" \
+        >/dev/null 2>&1
+}
+
+# 1. conda 'glider' env
+if command -v conda &>/dev/null; then
+    CONDA_BASE=$(conda info --base 2>/dev/null)
+    for ENV in glider base; do
+        PY="$CONDA_BASE/envs/$ENV/bin/python"
+        if [ ! -x "$PY" ] && [ "$ENV" = "base" ]; then
+            PY="$CONDA_BASE/bin/python"
+        fi
+        if [ -x "$PY" ] && _has_packages "$PY"; then
+            PYTHON="$PY"
+            break
+        fi
+    done
 fi
 
-echo "Using Python: $($PYTHON --version 2>&1)"
-echo "Pipeline dir: $PIPELINE_DIR"
+# 2. ~/glider_env venv
+if [ -z "$PYTHON" ] && [ -x "$HOME/glider_env/bin/python" ]; then
+    if _has_packages "$HOME/glider_env/bin/python"; then
+        PYTHON="$HOME/glider_env/bin/python"
+    fi
+fi
+
+# 3. Any python3 with packages
+if [ -z "$PYTHON" ]; then
+    for PY in python3 python; do
+        if command -v "$PY" &>/dev/null && _has_packages "$PY"; then
+            PYTHON="$PY"
+            break
+        fi
+    done
+fi
+
+# 4. Fall back to whatever python3 is (warn about missing packages)
+if [ -z "$PYTHON" ]; then
+    if command -v python3 &>/dev/null; then
+        PYTHON=python3
+        echo "WARNING: Could not find Python with all glider packages."
+        echo "  Install with:  pip install dbdreader xarray gsw scipy matplotlib pandas netCDF4"
+        echo "  Or activate your conda/venv environment first."
+        echo ""
+    else
+        echo "ERROR: No Python found."
+        exit 1
+    fi
+fi
+
+echo "Python:   $($PYTHON --version 2>&1)"
+echo "Pipeline: $PIPELINE_DIR"
 echo ""
 
-# ---- Run ----
 if [ -z "$1" ]; then
     "$PYTHON" "$PIPELINE_DIR/run_pipeline.py"
 else
