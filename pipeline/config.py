@@ -23,17 +23,22 @@ import re
 import numpy as np
 
 # ============================================================
-# EDIT THIS ONE LINE — set your glider data folder path
+# DATA_DIR — set your glider data folder here
 # Windows:  DATA_DIR = r"T:\glider_data\890_2"
 # Linux:    DATA_DIR = "/data/glider/890_2"
 #
-# You can also override this without editing this file:
+# BETTER: pass it at runtime and never edit this file:
 #   bash run_pipeline.sh /path/to/your/data
+#   python run_pipeline.py --data-dir /path/to/your/data
 #
-# The script auto-detects if an L0-timeseries/ folder exists
-# and skips binary decoding (Step 1) automatically.
+# The run_pipeline.sh auto-detects L0-timeseries/ folders
+# and skips binary decoding automatically.
 # ============================================================
-DATA_DIR = os.environ.get("GLIDER_DATA_DIR", "/home/incois/PAJO/GliderProcessingChain/Glider_RTQC/Raw_Data/890_2023")
+DATA_DIR = os.environ.get(
+    "GLIDER_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "..", "..", "Raw_Data", "1130-Mar-2025")
+)
 
 # ============================================================
 # Auto-derived paths  (do not edit)

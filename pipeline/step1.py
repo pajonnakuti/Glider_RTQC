@@ -95,63 +95,71 @@ def _sanitize_cache_dir(cache_dir):
 def _open_multidbd(filenames, cache_dir):
     """
     Open a dbdreader.MultiDBD robustly.
-
-    Strategy:
-      1. Sanitize cache dir (remove non-ASCII .cac files).
-      2. Try opening all files at once (fast path).
-      3. If UnicodeDecodeError → fall back to file-by-file, skipping bad files.
-         This handles Slocum binaries with non-ASCII sensor names (e.g. byte
-         0xe9 from French/Latin-1 characters in the sensor list).
+    Suppresses dbdreader's internal "File X could not be loaded" prints.
+    Falls back to file-by-file on any open error (cache missing, non-ASCII,
+    corrupt files).
     """
+    import contextlib
+
     os.makedirs(cache_dir, exist_ok=True)
     _sanitize_cache_dir(cache_dir)
 
     if not filenames:
         raise RuntimeError("No files provided")
 
-    # Fast path: try all at once
+    devnull = open(os.devnull, "w")
+
+    # Fast path: try all at once, suppress noisy prints
     try:
-        return dbdreader.MultiDBD(filenames=filenames, cacheDir=cache_dir)
+        with contextlib.redirect_stdout(devnull):
+            result = dbdreader.MultiDBD(filenames=filenames, cacheDir=cache_dir)
+        devnull.close()
+        return result
     except UnicodeDecodeError:
         pass   # fall through to file-by-file
     except Exception as e:
         err_str = str(e).lower()
-        # Cache-missing and file-load errors — try file-by-file
-        if ("cache" in err_str or "could not be found" in err_str
-                or "could not be loaded" in err_str or "dbderror" in err_str):
-            pass   # fall through
+        if any(k in err_str for k in ("cache", "could not be found",
+                                      "could not be loaded", "dbderror",
+                                      "no loadable")):
+            pass   # fall through to file-by-file
         else:
+            devnull.close()
             raise
+    finally:
+        try:
+            devnull.close()
+        except Exception:
+            pass
 
-    # Slow path: load one file at a time, skip problematic ones
+    # Slow path: one file at a time, suppress prints, categorize errors
     print(f"  Batch open failed — trying {len(filenames)} files one-by-one...")
     good_files = []
-    bad = 0
-    bad_reasons = {"unicode": 0, "cache": 0, "corrupt": 0}
+    counts = {"unicode": 0, "cache": 0, "corrupt": 0}
+
+    devnull2 = open(os.devnull, "w")
     for fpath in filenames:
         try:
-            tmp = dbdreader.MultiDBD(filenames=[fpath], cacheDir=cache_dir)
+            with contextlib.redirect_stdout(devnull2):
+                tmp = dbdreader.MultiDBD(filenames=[fpath], cacheDir=cache_dir)
             tmp.close()
             good_files.append(fpath)
         except UnicodeDecodeError:
-            bad += 1
-            bad_reasons["unicode"] += 1
+            counts["unicode"] += 1
         except Exception as e:
             err_str = str(e).lower()
             if "cache" in err_str or "could not be found" in err_str:
-                bad += 1
-                bad_reasons["cache"] += 1
-                # Don't include — dbdreader can't decode without cache
+                counts["cache"] += 1
             elif "could not be loaded" in err_str or "truncat" in err_str:
-                bad += 1
-                bad_reasons["corrupt"] += 1
+                counts["corrupt"] += 1
             else:
-                # Unknown error — include and let the batch handle it
-                good_files.append(fpath)
+                good_files.append(fpath)   # unknown — include anyway
+    devnull2.close()
 
-    if bad:
-        parts = [f"{v} {k}" for k, v in bad_reasons.items() if v > 0]
-        print(f"  Skipped {bad} file(s): {', '.join(parts)}")
+    total_bad = sum(counts.values())
+    if total_bad:
+        parts = [f"{v} {k}" for k, v in counts.items() if v > 0]
+        print(f"  Skipped {total_bad} file(s): {', '.join(parts)}")
     if not good_files:
         raise RuntimeError("No loadable files found")
 
