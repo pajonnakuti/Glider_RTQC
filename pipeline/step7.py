@@ -330,7 +330,9 @@ def plot_surface_properties(grid, plot_path=None):
                  fontsize=13, fontweight="bold")
 
     for ax, (var, label, cmap_n) in zip(axes, props_ok):
-        V_surf = np.nanmean(grid[var].values[:, surf], axis=1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            V_surf = np.nanmean(grid[var].values[:, surf], axis=1)
         valid  = np.isfinite(V_surf)
         if not valid.any():
             ax.set_title(f"{label} — NO DATA")
@@ -339,9 +341,11 @@ def plot_surface_properties(grid, plot_path=None):
         sm = uniform_filter1d(V_surf, size=5, mode="nearest")
         sm[~valid] = np.nan
         ax.plot(T[valid], sm[valid], linewidth=1.5, color="steelblue")
-        # fill between line and axis bottom (not y=0 which is wrong for temperatures)
-        ax.fill_between(T[valid], sm[valid],
-                        np.nanmin(sm[valid]),
+        # fill between line and axis bottom
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            ymin = np.nanmin(sm[valid]) if valid.any() else 0
+        ax.fill_between(T[valid], sm[valid], ymin,
                         alpha=0.15, color="steelblue")
         ax.set_ylabel(label, fontsize=10)
         ax.grid(True, linestyle="--", alpha=0.4)
