@@ -155,6 +155,14 @@ def main():
         run_step6(l0_path=l0_path, l1_path=l1_path, grid_path=grid_path)
         print()
 
+    # ------------------------------------------------------------------
+    # Step 7: Oceanographic section plots (contours, envelopes, etc.)
+    # ------------------------------------------------------------------
+    if grid_path and os.path.exists(grid_path):
+        from step7 import run_step7
+        run_step7(grid_path=grid_path, l1_path=l1_path)
+        print()
+
     elapsed = time.time() - t_start
     print("=" * 60)
     print(f"  PIPELINE COMPLETE in {elapsed:.1f}s")
