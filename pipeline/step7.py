@@ -18,6 +18,7 @@ Produces (in output/plots/):
 import os
 import sys
 import time
+import warnings
 import numpy as np
 import xarray as xr
 import matplotlib
@@ -158,14 +159,16 @@ def _contour_section(grid, var, title, units, cmap_name,
                          rasterized=True)
     _add_colorbar(fig, ax, mesh, f"{var} ({units})")
 
-    # Contour lines
-    X, Y = np.meshgrid(mdates.date2num(T), D)
-    V_sm = V.copy()
-    V_sm[~np.isfinite(V_sm)] = np.nanmean(V_sm[np.isfinite(V_sm)])
-    levels = np.linspace(vmin, vmax, n_contours)
+    # Contour lines — only where we have real data (no NaN fill)
     try:
-        ax.contour(X.T, Y.T, V_sm, levels=levels,
-                   colors="k", linewidths=0.4, alpha=0.5)
+        from scipy.ndimage import uniform_filter
+        # Use a copy with NaN kept; matplotlib.contour handles masked arrays
+        import numpy.ma as ma
+        V_ma = ma.masked_invalid(V)
+        X, Y = np.meshgrid(mdates.date2num(T), D)
+        levels = np.linspace(vmin, vmax, n_contours)
+        ax.contour(X.T, Y.T, V_ma, levels=levels,
+                   colors="k", linewidths=0.4, alpha=0.4)
     except Exception:
         pass
 
@@ -173,13 +176,14 @@ def _contour_section(grid, var, title, units, cmap_name,
     if overlay_var and overlay_var in grid:
         OV = grid[overlay_var].values[:, dm].copy()
         OV = _mask_gaps(OV, T)
-        OV_sm = OV.copy()
-        OV_sm[~np.isfinite(OV_sm)] = np.nanmean(OV_sm[np.isfinite(OV_sm)])
+        import numpy.ma as ma
+        OV_ma = ma.masked_invalid(OV)
         o_levels = np.linspace(
-            np.nanpercentile(OV_sm, 5),
-            np.nanpercentile(OV_sm, 95), 8)
+            np.nanpercentile(OV[np.isfinite(OV)], 5),
+            np.nanpercentile(OV[np.isfinite(OV)], 95), 8)
         try:
-            cs = ax.contour(X.T, Y.T, OV_sm, levels=o_levels,
+            X2, Y2 = np.meshgrid(mdates.date2num(T), D)
+            cs = ax.contour(X2.T, Y2.T, OV_ma, levels=o_levels,
                             colors="white", linewidths=0.8, alpha=0.7)
             ax.clabel(cs, fmt="%.1f", fontsize=7, colors="white")
         except Exception:
@@ -284,12 +288,14 @@ def plot_profile_envelopes(grid, plot_path=None):
         ax.plot(med[valid], D[valid], color="steelblue",
                 linewidth=2, label="Median")
 
-        ax.invert_yaxis()
         ax.set_xlabel(label, fontsize=11)
         ax.set_ylabel("Depth (m)", fontsize=11)
         ax.set_title(var.replace("_", " ").title(), fontsize=11)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.legend(fontsize=9, loc="lower right")
+
+    # invert once after all panels are drawn (sharey means one inversion is enough)
+    axes[0].invert_yaxis()
 
     _save(fig, plot_path)
     return plot_path
@@ -333,7 +339,10 @@ def plot_surface_properties(grid, plot_path=None):
         sm = uniform_filter1d(V_surf, size=5, mode="nearest")
         sm[~valid] = np.nan
         ax.plot(T[valid], sm[valid], linewidth=1.5, color="steelblue")
-        ax.fill_between(T[valid], V_surf[valid], alpha=0.2, color="steelblue")
+        # fill between line and axis bottom (not y=0 which is wrong for temperatures)
+        ax.fill_between(T[valid], sm[valid],
+                        np.nanmin(sm[valid]),
+                        alpha=0.15, color="steelblue")
         ax.set_ylabel(label, fontsize=10)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.set_title(label, fontsize=10)
@@ -367,15 +376,32 @@ def plot_isotherm_depths(grid, plot_path=None):
                 valid = np.isfinite(prof)
                 if valid.sum() < 3:
                     continue
-                # Find first depth where temp drops below T_iso
-                below = np.where(valid & (prof < T_iso))[0]
-                if below.size:
-                    depths[i] = float(D_vals[below[0]])
-            valid = np.isfinite(depths)
-            if valid.any():
-                ax.plot(T_vals[valid], depths[valid], linewidth=1.5,
-                        color=col, label=f"{T_iso}°C")
+                # Only compute isotherm if surface temperature is ABOVE the threshold
+                # (i.e. the isotherm actually exists in the water column)
+                surf_T = prof[valid][0]  # shallowest valid point
+                if surf_T <= T_iso:
+                    continue  # water never warm enough — isotherm absent
+                # Find where temperature drops below T_iso (linear interpolation)
+                d_v = D_vals[valid]
+                p_v = prof[valid]
+                below = np.where(p_v < T_iso)[0]
+                if below.size == 0:
+                    continue  # temp stays above T_iso to max depth
+                idx = below[0]
+                if idx == 0:
+                    depths[i] = float(d_v[0])
+                else:
+                    # Linear interpolation between idx-1 and idx
+                    t1, t2 = p_v[idx-1], p_v[idx]
+                    d1, d2 = d_v[idx-1], d_v[idx]
+                    if t1 != t2:
+                        depths[i] = d1 + (T_iso - t1) / (t2 - t1) * (d2 - d1)
+            valid_mask = np.isfinite(depths)
+            if valid_mask.any():
+                ax.plot(T_vals[valid_mask], depths[valid_mask],
+                        linewidth=1.5, color=col, label=f"{T_iso}°C")
         ax.invert_yaxis()
+        ax.set_ylim(500, 0)   # isotherms are typically in top 500m
         ax.set_ylabel("Depth (m)", fontsize=11)
         ax.set_title("Isotherm Depths", fontsize=11)
         ax.legend(fontsize=9, ncol=5, loc="upper right")
@@ -392,17 +418,32 @@ def plot_isotherm_depths(grid, plot_path=None):
             depths = np.full(n_t, np.nan)
             for i in range(n_t):
                 prof = V[i, :]
-                valid = np.isfinite(prof)
-                if valid.sum() < 3:
+                valid_mask = np.isfinite(prof)
+                if valid_mask.sum() < 3:
                     continue
-                below = np.where(valid & (prof > rho))[0]
-                if below.size:
-                    depths[i] = float(D_vals[below[0]])
-            valid = np.isfinite(depths)
-            if valid.any():
-                ax.plot(T_vals[valid], depths[valid], linewidth=1.5,
-                        color=col, label=f"σ₀={rho-1000:.1f}")
+                d_v = D_vals[valid_mask]
+                p_v = prof[valid_mask]
+                # Only compute if surface density is BELOW the isopycnal
+                if p_v[0] >= rho:
+                    continue  # too dense at surface — isopycnal absent
+                below = np.where(p_v > rho)[0]
+                if below.size == 0:
+                    continue
+                idx = below[0]
+                if idx == 0:
+                    depths[i] = float(d_v[0])
+                else:
+                    r1, r2 = p_v[idx-1], p_v[idx]
+                    d1, d2 = d_v[idx-1], d_v[idx]
+                    if r1 != r2:
+                        depths[i] = d1 + (rho - r1) / (r2 - r1) * (d2 - d1)
+            valid_mask2 = np.isfinite(depths)
+            if valid_mask2.any():
+                ax.plot(T_vals[valid_mask2], depths[valid_mask2],
+                        linewidth=1.5, color=col,
+                        label=f"σ₀={rho-1000:.1f}")
         ax.invert_yaxis()
+        ax.set_ylim(600, 0)
         ax.set_ylabel("Depth (m)", fontsize=11)
         ax.set_title("Isopycnal Depths", fontsize=11)
         ax.legend(fontsize=9, ncol=5, loc="upper right")
@@ -430,9 +471,11 @@ def plot_hovmoller(grid, plot_path=None):
     V, D = V[:, dm], D[dm]
     V = _mask_gaps(V, T)
 
-    # Anomaly = T − depth-mean profile
-    mean_prof = np.nanmean(V, axis=0)
-    anom = V - mean_prof[np.newaxis, :]
+    # Anomaly = T(t,z) − time-mean at each depth (climatological profile removed)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mean_at_depth = np.nanmean(V, axis=0)   # shape: (n_depth,)
+    anom = V - mean_at_depth[np.newaxis, :]
 
     valid = np.isfinite(anom)
     if not valid.any():
@@ -480,13 +523,12 @@ def plot_vertical_gradients(grid, plot_path=None):
             ax.set_title(f"{ylabel} — no data")
             continue
         V = grid[var].values.copy()
-        dm = D <= min(500, _max_data_depth(V, D))
+        dm = D <= min(600, _max_data_depth(V, D))
         V_trim, D_trim = V[:, dm], D[dm]
         V_trim = _mask_gaps(V_trim, T)
 
-        # Gradient: dV/dz (positive = increasing with depth)
-        dz = np.gradient(D_trim)
-        dVdz = np.gradient(V_trim, axis=1) / dz[np.newaxis, :]
+        # Gradient: dV/dz using actual depth spacing (correct for 1m bins)
+        dVdz = np.gradient(V_trim, D_trim, axis=1)
         dVdz[~np.isfinite(V_trim)] = np.nan
 
         valid = np.isfinite(dVdz)
