@@ -114,14 +114,20 @@ def _open_multidbd(filenames, cache_dir):
         return dbdreader.MultiDBD(filenames=filenames, cacheDir=cache_dir)
     except UnicodeDecodeError:
         pass   # fall through to file-by-file
-    except Exception:
-        raise
+    except Exception as e:
+        err_str = str(e).lower()
+        # Cache-missing and file-load errors — try file-by-file
+        if ("cache" in err_str or "could not be found" in err_str
+                or "could not be loaded" in err_str or "dbderror" in err_str):
+            pass   # fall through
+        else:
+            raise
 
-    # Slow path: load one file at a time, skip non-ASCII ones
-    print(f"  Batch open failed (non-ASCII sensor names) — "
-          f"trying {len(filenames)} files one-by-one...")
+    # Slow path: load one file at a time, skip problematic ones
+    print(f"  Batch open failed — trying {len(filenames)} files one-by-one...")
     good_files = []
     bad = 0
+    bad_reasons = {"unicode": 0, "cache": 0, "corrupt": 0}
     for fpath in filenames:
         try:
             tmp = dbdreader.MultiDBD(filenames=[fpath], cacheDir=cache_dir)
@@ -129,15 +135,25 @@ def _open_multidbd(filenames, cache_dir):
             good_files.append(fpath)
         except UnicodeDecodeError:
             bad += 1
-        except Exception:
-            # Other errors (missing cache, truncated file) — include anyway,
-            # the batch open will handle or skip them
-            good_files.append(fpath)
+            bad_reasons["unicode"] += 1
+        except Exception as e:
+            err_str = str(e).lower()
+            if "cache" in err_str or "could not be found" in err_str:
+                bad += 1
+                bad_reasons["cache"] += 1
+                # Don't include — dbdreader can't decode without cache
+            elif "could not be loaded" in err_str or "truncat" in err_str:
+                bad += 1
+                bad_reasons["corrupt"] += 1
+            else:
+                # Unknown error — include and let the batch handle it
+                good_files.append(fpath)
 
     if bad:
-        print(f"  Skipped {bad} file(s) with non-ASCII sensor names")
+        parts = [f"{v} {k}" for k, v in bad_reasons.items() if v > 0]
+        print(f"  Skipped {bad} file(s): {', '.join(parts)}")
     if not good_files:
-        raise RuntimeError("No files with ASCII-compatible sensor names found")
+        raise RuntimeError("No loadable files found")
 
     print(f"  Loaded {len(good_files)}/{len(filenames)} files successfully")
     return dbdreader.MultiDBD(filenames=good_files, cacheDir=cache_dir)
