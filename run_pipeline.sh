@@ -4,15 +4,21 @@
 #
 #  USAGE
 #  -----
-#  From the SSH machine or WSL:
-#    bash run_pipeline.sh                          # uses DATA_DIR in config.py
-#    bash run_pipeline.sh /path/to/data/890_2023   # override data folder
+#  Basic (uses DATA_DIR set in pipeline/config.py):
+#    bash run_pipeline.sh
 #
-#  The script auto-finds Python with all dependencies installed.
-#  It checks (in order):
+#  Override data folder:
+#    bash run_pipeline.sh /path/to/glider_data/890_2
+#
+#  With explicit L0 (skip binary decode, use existing L0):
+#    bash run_pipeline.sh /path/to/data/890_2 /path/to/L0.nc
+#
+#  PYTHON ENVIRONMENT
+#  ------------------
+#  Looks for Python in this order:
 #    1. conda 'glider' or 'base' environment
 #    2. ~/glider_env/bin/python  (venv)
-#    3. System python3 (may lack packages)
+#    3. Any python3/python with required packages
 # ============================================================
 
 set -e
@@ -21,67 +27,86 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_DIR="$SCRIPT_DIR/pipeline"
 
 # ---- Find Python with all required packages ----
-PYTHON=""
-
-# Helper: test if a python executable has all required packages
 _has_packages() {
-    local py="$1"
-    "$py" -c "import dbdreader, xarray, gsw, scipy, matplotlib, numpy, netCDF4" \
+    "$1" -c "import dbdreader, xarray, gsw, scipy, matplotlib, numpy, netCDF4" \
         >/dev/null 2>&1
 }
 
-# 1. conda 'glider' env
+PYTHON=""
+
+# 1. conda environments
 if command -v conda &>/dev/null; then
     CONDA_BASE=$(conda info --base 2>/dev/null)
     for ENV in glider base; do
         PY="$CONDA_BASE/envs/$ENV/bin/python"
-        if [ ! -x "$PY" ] && [ "$ENV" = "base" ]; then
-            PY="$CONDA_BASE/bin/python"
-        fi
+        [ "$ENV" = "base" ] && PY="$CONDA_BASE/bin/python"
         if [ -x "$PY" ] && _has_packages "$PY"; then
-            PYTHON="$PY"
-            break
+            PYTHON="$PY"; break
         fi
     done
 fi
 
 # 2. ~/glider_env venv
 if [ -z "$PYTHON" ] && [ -x "$HOME/glider_env/bin/python" ]; then
-    if _has_packages "$HOME/glider_env/bin/python"; then
-        PYTHON="$HOME/glider_env/bin/python"
-    fi
+    _has_packages "$HOME/glider_env/bin/python" && PYTHON="$HOME/glider_env/bin/python"
 fi
 
-# 3. Any python3 with packages
+# 3. system python3/python
 if [ -z "$PYTHON" ]; then
     for PY in python3 python; do
         if command -v "$PY" &>/dev/null && _has_packages "$PY"; then
-            PYTHON="$PY"
-            break
+            PYTHON="$PY"; break
         fi
     done
 fi
 
-# 4. Fall back to whatever python3 is (warn about missing packages)
+# 4. fall back to whatever python3 is
 if [ -z "$PYTHON" ]; then
-    if command -v python3 &>/dev/null; then
-        PYTHON=python3
-        echo "WARNING: Could not find Python with all glider packages."
-        echo "  Install with:  pip install dbdreader xarray gsw scipy matplotlib pandas netCDF4"
-        echo "  Or activate your conda/venv environment first."
-        echo ""
-    else
-        echo "ERROR: No Python found."
-        exit 1
-    fi
+    command -v python3 &>/dev/null && PYTHON=python3 || { echo "ERROR: No Python found."; exit 1; }
+    echo "WARNING: Python found but may be missing packages. Run:"
+    echo "  pip install dbdreader xarray gsw scipy matplotlib pandas netCDF4"
+    echo ""
 fi
 
 echo "Python:   $($PYTHON --version 2>&1)"
 echo "Pipeline: $PIPELINE_DIR"
 echo ""
 
-if [ -z "$1" ]; then
-    "$PYTHON" "$PIPELINE_DIR/run_pipeline.py"
-else
-    "$PYTHON" "$PIPELINE_DIR/run_pipeline.py" --data-dir "$1"
+DATA_DIR_ARG=""
+L0_ARG=""
+SKIP_ARG=""
+
+# --- Parse arguments ---
+if [ -n "$1" ]; then
+    DATA_DIR_ARG="--data-dir $1"
 fi
+if [ -n "$2" ]; then
+    # Explicit L0 path provided — skip step 1
+    L0_ARG="--l0-path $2"
+    SKIP_ARG="--skip-step1"
+else
+    # Auto-detect: if DATA_DIR has an L0-timeseries folder, use it and skip step 1
+    DATA_DIR="${1:-}"
+    if [ -z "$DATA_DIR" ]; then
+        # Get DATA_DIR from config.py
+        DATA_DIR=$("$PYTHON" -c "
+import sys; sys.path.insert(0, '$PIPELINE_DIR')
+import config; print(config.DATA_DIR)
+" 2>/dev/null)
+    fi
+
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR/L0-timeseries" ]; then
+        # Find the largest NC file in L0-timeseries
+        L0_FILE=$(ls -S "$DATA_DIR/L0-timeseries/"*.nc 2>/dev/null | head -1)
+        if [ -n "$L0_FILE" ] && [ -f "$L0_FILE" ]; then
+            echo "Auto-detected L0: $L0_FILE"
+            echo "Skipping Step 1 (binary decode) — using existing L0 timeseries"
+            echo ""
+            L0_ARG="--l0-path $L0_FILE"
+            SKIP_ARG="--skip-step1"
+        fi
+    fi
+fi
+
+# --- Run ---
+"$PYTHON" "$PIPELINE_DIR/run_pipeline.py" $DATA_DIR_ARG $L0_ARG $SKIP_ARG
