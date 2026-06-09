@@ -72,10 +72,12 @@ def _mask_time_gaps(data, time_values, gap_hours=GAP_THRESHOLD_HOURS):
 def _max_data_depth(ds, vars_list, depth_vals):
     """Find the deepest depth bin that has any valid data."""
     max_d = 0.0
+    n_depth = len(depth_vals)
     for var in vars_list:
         if var in ds:
             v = ds[var].values
-            if v.ndim == 2:
+            # Only handle 2D (time × depth) variables
+            if v.ndim == 2 and v.shape[1] == n_depth:
                 col_valid = np.any(np.isfinite(v), axis=0)
                 if np.any(col_valid):
                     max_d = max(max_d, float(depth_vals[col_valid].max()))

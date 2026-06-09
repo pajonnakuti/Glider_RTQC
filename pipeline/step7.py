@@ -96,8 +96,24 @@ def _pcolor_edges(centers):
 
 
 def _max_data_depth(V, depth_vals):
+    """Find deepest depth bin with data. V must be (n_time, n_depth)."""
+    if V.ndim != 2 or V.shape[1] != len(depth_vals):
+        return float(depth_vals.max())
     col = np.any(np.isfinite(V), axis=0)
     return float(depth_vals[col].max()) if col.any() else float(depth_vals.max())
+
+
+def _get_2d(grid, var):
+    """
+    Return the 2D (n_time, n_depth) array for `var` from grid.
+    Returns None if the variable is missing or not 2D time×depth.
+    """
+    if var not in grid:
+        return None
+    v = grid[var].values
+    if v.ndim != 2 or v.shape != (len(grid.time), len(grid.depth)):
+        return None
+    return v.copy()
 
 
 def _add_colorbar(fig, ax, mesh, label, fontsize=10):
@@ -135,6 +151,11 @@ def _contour_section(grid, var, title, units, cmap_name,
     V = grid[var].values.copy()
     T = grid.time.values
     D = grid.depth.values
+
+    # Only handle 2D (time × depth) variables
+    if V.ndim != 2 or V.shape[1] != len(D):
+        print(f"  SKIP: {var} is not a 2D time×depth variable")
+        return None
 
     if depth_max is None:
         depth_max = _max_data_depth(V, D)
@@ -212,7 +233,9 @@ def _dual_contour_section(grid, var1, var2, titles, units,
     all_V = []
     for v in [var1, var2]:
         if v in grid:
-            V = grid[v].values.copy()
+            V = _get_2d(grid, v)
+            if V is None:
+                continue
             valid = V[np.isfinite(V)]
             vmin = np.nanpercentile(valid, 2) if len(valid) else 0
             vmax = np.nanpercentile(valid, 98) if len(valid) else 1
@@ -273,7 +296,10 @@ def plot_profile_envelopes(grid, plot_path=None):
                  fontsize=13, fontweight="bold")
 
     for ax, (var, label, _) in zip(axes, vars_present):
-        V = grid[var].values          # (n_prof, n_depth)
+        V = _get_2d(grid, var)
+        if V is None:
+            ax.set_title(f"{label} — no 2D data")
+            continue
         mn  = np.nanmin(V,  axis=0)
         mx  = np.nanmax(V,  axis=0)
         med = np.nanmedian(V, axis=0)
@@ -330,9 +356,13 @@ def plot_surface_properties(grid, plot_path=None):
                  fontsize=13, fontweight="bold")
 
     for ax, (var, label, cmap_n) in zip(axes, props_ok):
+        V = _get_2d(grid, var)
+        if V is None:
+            ax.set_title(f"{label} — not 2D")
+            continue
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            V_surf = np.nanmean(grid[var].values[:, surf], axis=1)
+            V_surf = np.nanmean(V[:, surf], axis=1)
         valid  = np.isfinite(V_surf)
         if not valid.any():
             ax.set_title(f"{label} — NO DATA")
@@ -360,92 +390,82 @@ def plot_surface_properties(grid, plot_path=None):
 def plot_isotherm_depths(grid, plot_path=None):
     """Track depth of specific isotherms and isopycnals over time."""
     print("  Generating isotherm depth timeseries...")
-    T_vals  = grid.time.values
-    D_vals  = grid.depth.values
-    n_t     = len(T_vals)
+    T_vals = grid.time.values
+    D_vals = grid.depth.values
+    n_t    = len(T_vals)
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
     fig.suptitle(f"Glider {GLIDER_ID}  —  Isotherm & Isopycnal Depths",
                  fontsize=13, fontweight="bold")
 
+    def _interp_threshold(prof_2d, d_arr, threshold, above=True):
+        """
+        Find the depth where prof_2d crosses threshold using linear interpolation.
+        above=True  → find where values DROP below threshold (isotherms)
+        above=False → find where values RISE above threshold (isopycnals)
+        Returns array of depths, NaN where crossing not found.
+        """
+        depths = np.full(len(prof_2d), np.nan)
+        for i, prof in enumerate(prof_2d):
+            valid = np.isfinite(prof)
+            if valid.sum() < 3:
+                continue
+            d_v = d_arr[valid]
+            p_v = prof[valid]
+            # Check surface condition
+            if above and p_v[0] <= threshold:
+                continue   # always below threshold — isotherm absent
+            if not above and p_v[0] >= threshold:
+                continue   # always above threshold — isopycnal absent
+            # Find crossing
+            if above:
+                idx_arr = np.where(p_v < threshold)[0]
+            else:
+                idx_arr = np.where(p_v > threshold)[0]
+            if idx_arr.size == 0:
+                continue
+            idx = idx_arr[0]
+            if idx == 0:
+                depths[i] = float(d_v[0])
+            else:
+                v1, v2 = p_v[idx-1], p_v[idx]
+                d1, d2 = d_v[idx-1], d_v[idx]
+                if v1 != v2:
+                    depths[i] = d1 + (threshold - v1) / (v2 - v1) * (d2 - d1)
+        return depths
+
     # --- Isotherms ---
     ax = axes[0]
-    if "potential_temperature" in grid:
-        V = grid["potential_temperature"].values
+    V_temp = _get_2d(grid, "potential_temperature")
+    if V_temp is not None:
         for T_iso, col in [(28, "#d62728"), (25, "#ff7f0e"),
                            (20, "#2ca02c"), (15, "#1f77b4"), (10, "#9467bd")]:
-            depths = np.full(n_t, np.nan)
-            for i in range(n_t):
-                prof = V[i, :]
-                valid = np.isfinite(prof)
-                if valid.sum() < 3:
-                    continue
-                # Only compute isotherm if surface temperature is ABOVE the threshold
-                # (i.e. the isotherm actually exists in the water column)
-                surf_T = prof[valid][0]  # shallowest valid point
-                if surf_T <= T_iso:
-                    continue  # water never warm enough — isotherm absent
-                # Find where temperature drops below T_iso (linear interpolation)
-                d_v = D_vals[valid]
-                p_v = prof[valid]
-                below = np.where(p_v < T_iso)[0]
-                if below.size == 0:
-                    continue  # temp stays above T_iso to max depth
-                idx = below[0]
-                if idx == 0:
-                    depths[i] = float(d_v[0])
-                else:
-                    # Linear interpolation between idx-1 and idx
-                    t1, t2 = p_v[idx-1], p_v[idx]
-                    d1, d2 = d_v[idx-1], d_v[idx]
-                    if t1 != t2:
-                        depths[i] = d1 + (T_iso - t1) / (t2 - t1) * (d2 - d1)
-            valid_mask = np.isfinite(depths)
-            if valid_mask.any():
-                ax.plot(T_vals[valid_mask], depths[valid_mask],
-                        linewidth=1.5, color=col, label=f"{T_iso}°C")
+            depths = _interp_threshold(V_temp, D_vals, T_iso, above=True)
+            ok = np.isfinite(depths)
+            if ok.any():
+                ax.plot(T_vals[ok], depths[ok], linewidth=1.5,
+                        color=col, label=f"{T_iso}°C")
         ax.invert_yaxis()
-        ax.set_ylim(500, 0)   # isotherms are typically in top 500m
+        ax.set_ylim(500, 0)
         ax.set_ylabel("Depth (m)", fontsize=11)
         ax.set_title("Isotherm Depths", fontsize=11)
         ax.legend(fontsize=9, ncol=5, loc="upper right")
         ax.grid(True, linestyle="--", alpha=0.4)
+    else:
+        axes[0].set_title("Isotherm Depths — no temperature data")
 
     # --- Isopycnals ---
     ax = axes[1]
-    pden_var = "potential_density" if "potential_density" in grid else None
-    if pden_var:
-        V = grid[pden_var].values
+    V_pden = _get_2d(grid, "potential_density")
+    if V_pden is not None:
         for rho, col in [(1024.0, "#d62728"), (1025.0, "#ff7f0e"),
                          (1025.5, "#2ca02c"), (1026.0, "#1f77b4"),
                          (1026.5, "#9467bd")]:
-            depths = np.full(n_t, np.nan)
-            for i in range(n_t):
-                prof = V[i, :]
-                valid_mask = np.isfinite(prof)
-                if valid_mask.sum() < 3:
-                    continue
-                d_v = D_vals[valid_mask]
-                p_v = prof[valid_mask]
-                # Only compute if surface density is BELOW the isopycnal
-                if p_v[0] >= rho:
-                    continue  # too dense at surface — isopycnal absent
-                below = np.where(p_v > rho)[0]
-                if below.size == 0:
-                    continue
-                idx = below[0]
-                if idx == 0:
-                    depths[i] = float(d_v[0])
-                else:
-                    r1, r2 = p_v[idx-1], p_v[idx]
-                    d1, d2 = d_v[idx-1], d_v[idx]
-                    if r1 != r2:
-                        depths[i] = d1 + (rho - r1) / (r2 - r1) * (d2 - d1)
-            valid_mask2 = np.isfinite(depths)
-            if valid_mask2.any():
-                ax.plot(T_vals[valid_mask2], depths[valid_mask2],
-                        linewidth=1.5, color=col,
-                        label=f"σ₀={rho-1000:.1f}")
+            depths = _interp_threshold(V_pden, D_vals, rho, above=False)
+            ok = np.isfinite(depths)
+            if ok.any():
+                ax.plot(T_vals[ok], depths[ok], linewidth=1.5,
+                        color=col, label=f"σ₀={rho-1000:.1f}")
         ax.invert_yaxis()
         ax.set_ylim(600, 0)
         ax.set_ylabel("Depth (m)", fontsize=11)
@@ -468,7 +488,10 @@ def plot_hovmoller(grid, plot_path=None):
         print("  SKIP: no temperature")
         return None
 
-    V = grid["potential_temperature"].values.copy()
+    V = _get_2d(grid, "potential_temperature")
+    if V is None:
+        print("  SKIP: potential_temperature not 2D")
+        return None
     T = grid.time.values
     D = grid.depth.values
     dm = D <= _max_data_depth(V, D)
@@ -523,10 +546,10 @@ def plot_vertical_gradients(grid, plot_path=None):
     te = _pcolor_edges(T)
 
     for var, ylabel, cmap_n, ax in cfgs:
-        if var not in grid:
-            ax.set_title(f"{ylabel} — no data")
+        V = _get_2d(grid, var)
+        if V is None:
+            ax.set_title(f"{ylabel} — no 2D data")
             continue
-        V = grid[var].values.copy()
         dm = D <= min(600, _max_data_depth(V, D))
         V_trim, D_trim = V[:, dm], D[dm]
         V_trim = _mask_gaps(V_trim, T)
@@ -563,12 +586,14 @@ def plot_ts_density(grid, plot_path=None):
     sigma-0 density contours overlaid.
     """
     print("  Generating T-S density diagram...")
-    if "potential_temperature" not in grid or "salinity" not in grid:
-        print("  SKIP: no T or S")
+    VT = _get_2d(grid, "potential_temperature")
+    VS = _get_2d(grid, "salinity")
+    if VT is None or VS is None:
+        print("  SKIP: T or S not 2D")
         return None
 
-    T_all = grid["potential_temperature"].values.ravel()
-    S_all = grid["salinity"].values.ravel()
+    T_all = VT.ravel()
+    S_all = VS.ravel()
     D_all = np.tile(grid.depth.values, len(grid.time))
     t_num = np.repeat(
         mdates.date2num(grid.time.values), len(grid.depth))
@@ -669,7 +694,9 @@ def plot_overview_section(grid, plot_path=None):
                  fontsize=14, fontweight="bold", y=1.001)
 
     for ax, (var, label, cmap_n, vmin, vmax) in zip(axes, panels_ok):
-        V = grid[var].values.copy()
+        V = _get_2d(grid, var)
+        if V is None:
+            ax.set_title(f"{label} — not 2D"); continue
         dm = D <= _max_data_depth(V, D)
         V_t, D_t = _mask_gaps(V[:, dm].copy(), T), D[dm]
 
@@ -816,7 +843,8 @@ def _contour_optics(grid, plot_path):
         ("backscatter_700","BBP700 (m⁻¹)",          "matter", 0.0, None),
     ]
     vars_ok = [(v, l, c, vn, vx) for v, l, c, vn, vx in vars_cfg
-               if v in grid and np.any(np.isfinite(grid[v].values))]
+               if _get_2d(grid, v) is not None
+               and np.any(np.isfinite(_get_2d(grid, v)))]
     if not vars_ok:
         print("  SKIP: no optics data")
         return None
@@ -834,7 +862,9 @@ def _contour_optics(grid, plot_path):
                  fontsize=13, fontweight="bold", y=1.001)
 
     for ax, (var, label, cmap_n, vmin_f, vmax_f) in zip(axes, vars_ok):
-        V = grid[var].values.copy()
+        V = _get_2d(grid, var)
+        if V is None:
+            ax.set_title(f"{label} — not 2D"); continue
         dm = D <= _max_data_depth(V, D)
         V_t, D_t = _mask_gaps(V[:, dm].copy(), T), D[dm]
         valid = np.isfinite(V_t)
