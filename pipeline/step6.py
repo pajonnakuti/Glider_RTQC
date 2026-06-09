@@ -592,21 +592,33 @@ def plot_mld(l1_path, grid_path=None, plot_path=None):
 
     # --- Manual fallback: temperature threshold 0.2°C from 10m ---
     if mld_vals is None and "potential_temperature" in ds:
-        T = ds["potential_temperature"].values  # (n_time, n_depth)
-        D = ds.depth.values
-        ref_idx = np.argmin(np.abs(D - 10))
-        mld_vals = np.full(T.shape[0], np.nan)
-        for i in range(T.shape[0]):
-            prof = T[i, :]
-            if np.sum(np.isfinite(prof)) < 5:
-                continue
-            ref_T = prof[ref_idx] if np.isfinite(prof[ref_idx]) else np.nanmean(prof[:ref_idx+2])
-            if not np.isfinite(ref_T):
-                continue
-            below = np.where((D > 10) & np.isfinite(prof) & (np.abs(prof - ref_T) > 0.2))[0]
-            mld_vals[i] = float(D[below[0]]) if len(below) > 0 else float(D[np.isfinite(prof)][-1])
-        mld_times = ds.time.values
-        print(f"    MLD via manual threshold: {int(np.sum(np.isfinite(mld_vals)))} profiles")
+        T_arr = ds["potential_temperature"].values
+        D     = ds.depth.values
+        # Guard: must be 2D (n_profiles × n_depth)
+        if T_arr.ndim != 2 or T_arr.shape[1] != len(D):
+            print("  WARNING: temperature not 2D — skipping MLD")
+        else:
+            ref_idx = np.argmin(np.abs(D - 10))
+            mld_vals = np.full(T_arr.shape[0], np.nan)
+            for i in range(T_arr.shape[0]):
+                prof = T_arr[i, :]
+                valid = np.isfinite(prof)
+                if valid.sum() < 5:
+                    continue
+                ref_T = (prof[ref_idx] if np.isfinite(prof[ref_idx])
+                         else np.nanmean(prof[:ref_idx + 2]))
+                if not np.isfinite(ref_T):
+                    continue
+                # Depths in this profile that are > 10m and show T change > 0.2°C
+                below = np.where((D > 10) & valid & (np.abs(prof - ref_T) > 0.2))[0]
+                if len(below) > 0:
+                    mld_vals[i] = float(D[below[0]])
+                else:
+                    # No threshold crossing — MLD = deepest valid point
+                    valid_depths = D[valid]
+                    mld_vals[i] = float(valid_depths[-1]) if len(valid_depths) > 0 else np.nan
+            mld_times = ds.time.values
+            print(f"    MLD via manual threshold: {int(np.sum(np.isfinite(mld_vals)))} profiles")
 
     if mld_vals is None or mld_times is None:
         ds.close()
