@@ -98,6 +98,13 @@ def _report_gaps(t_vals):
 
 def _draw_pcolormesh(ax, t_vals, depth_vals, V, cmap, label, max_depth):
     """Draw one pcolormesh panel. Returns True if data was plotted."""
+    # Guard: V must be exactly 2D (n_time × n_depth)
+    if V.ndim != 2 or V.shape != (len(t_vals), len(depth_vals)):
+        ax.set_title(f"{label} (not 2D)", fontsize=13)
+        ax.set_ylim(max_depth, 0)
+        ax.set_ylabel("Depth (m)", fontsize=11)
+        return False
+
     depth_mask = depth_vals <= max_depth
     V_trim = V[:, depth_mask]
     d_trim = depth_vals[depth_mask]
@@ -322,6 +329,12 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
             continue
 
         V = ds[var].values
+        # Only plot 2D (time × depth) variables
+        if not is_1d and (V.ndim != 2 or V.shape != (len(t_vals), len(depth_vals))):
+            ax.set_title(f"{var} (NOT 2D)", fontsize=13)
+            ax.set_ylim(max_depth, 0)
+            ax.set_ylabel("Depth (m)", fontsize=11)
+            continue
 
         if is_1d:
             depth_1d = ds.depth.values
