@@ -1028,9 +1028,10 @@ def run_step23(l0_path=None):
     ds.attrs["history"] = f"L1 processed on {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} using pipeline/step23.py"
     ds.attrs["processing_software"] = "pipeline/step23.py v1.0"
 
-    l1_dir = os.path.join(OUTPUT_DIR, "l1")
-    os.makedirs(l1_dir, exist_ok=True)
-    l1_path = os.path.join(l1_dir, f"incois_glider_{GLIDER_ID}_L1.nc")
+    # OUTPUT_DIR may be overridden by run_pipeline.py to point at L1-timeseries/
+    # Write directly into it (no extra l1/ subdirectory)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    l1_path = os.path.join(OUTPUT_DIR, f"incois_glider_{GLIDER_ID}_L1.nc")
     print(f"\n  Saving L1: {l1_path}")
     ds.to_netcdf(l1_path, mode="w", format="NETCDF4")
 
