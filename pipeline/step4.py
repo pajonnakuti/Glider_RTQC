@@ -173,15 +173,15 @@ def make_grid(nc_path, out_dir, grid_filename, apply_qc=False):
         d_arr = ds.depth.values[mask]
         prof_idx = np.where(mask)[0]
 
-    for var in vars_to_grid:
-        if var not in ds:
-            gridded[var].append(np.full(len(depth_centers), np.nan))
-            continue
-        v_arr = ds[var].values[mask]
-        # Skip if not 1D float (e.g. string, structured, or wrong shape)
-        if v_arr.ndim != 1 or not np.issubdtype(v_arr.dtype, np.floating):
-            gridded[var].append(np.full(len(depth_centers), np.nan))
-            continue
+        for var in vars_to_grid:
+            if var not in ds:
+                gridded[var].append(np.full(len(depth_centers), np.nan))
+                continue
+            v_arr = ds[var].values[mask]
+            # Skip if not 1D float (e.g. string, structured, or wrong shape)
+            if v_arr.ndim != 1 or not np.issubdtype(v_arr.dtype, np.floating):
+                gridded[var].append(np.full(len(depth_centers), np.nan))
+                continue
             if apply_qc and var in qc_masks:
                 qc_ok = qc_masks[var][prof_idx]
             else:
