@@ -241,6 +241,10 @@ def _dual_contour_section(grid, var1, var2, titles, units,
             vmax = np.nanpercentile(valid, 98) if len(valid) else 1
             all_V.append((v, V, vmin, vmax))
 
+    if not all_V:
+        print(f"  SKIP: no 2D data for {var1} or {var2}")
+        return None
+
     dm = D <= (depth_max or _max_data_depth(all_V[0][1], D))
     D_trim = D[dm]
 

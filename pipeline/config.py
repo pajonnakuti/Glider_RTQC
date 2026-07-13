@@ -24,7 +24,7 @@ import numpy as np
 
 # ============================================================
 # DATA_DIR — set your glider data folder here
-# Windows:  DATA_DIR = r"T:\glider_data\890_2"
+DATA_DIR = r"T:\glider_data\890_2"
 # Linux:    DATA_DIR = "/data/glider/890_2"
 #
 # BETTER: pass it at runtime and never edit this file:

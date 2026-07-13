@@ -10,7 +10,7 @@ Raw Binary Files (.dbd/.dcd/.ebd/.ecd)
         ▼
 ┌──────────────────────────────────────────────────────────┐
 │  L0 Products (input to our pipeline)                     │
-│  ├── L0-timeseries/incois_glider_{ID}_L0.nc             │
+│  ├── L0-timeseries/incois_glider_{ID}_L0.nc              │
 │  ├── L0-profiles/ (one .nc per profile)                  │
 │  └── L0-gridfiles/ (time × depth grid, all vars)         │
 └──────────────────────────────────────────────────────────┘
@@ -19,7 +19,7 @@ Raw Binary Files (.dbd/.dcd/.ebd/.ecd)
         ▼
 ┌──────────────────────────────────────────────────────────┐
 │  L1 Products (our output)                                │
-│  ├── L1-timeseries/incois_glider_{ID}_L1.nc             │
+│  ├── L1-timeseries/incois_glider_{ID}_L1.nc              │
 │  ├── L1-profiles/ (one .nc per profile, QC applied)      │
 │  ├── L1-gridfiles/ (time × depth, flags 1&2 only)        │
 │  ├── plots/ (19 diagnostic PNGs)                         │

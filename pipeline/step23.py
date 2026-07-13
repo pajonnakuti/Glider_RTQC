@@ -62,6 +62,17 @@ def pre_clean(ds):
 
     ds = ds.sortby("time")
 
+    # Physical plausibility pre-filter: catch factory test values and
+    # truly absurd readings BEFORE any other cleaning
+    if "temperature" in ds:
+        temp_vals = ds["temperature"].values.copy()
+        bad_temp = np.isfinite(temp_vals) & ((temp_vals < -2.5) | (temp_vals > 35.0))
+        n_preclean_temp = int(np.sum(bad_temp))
+        if n_preclean_temp > 0:
+            temp_vals[bad_temp] = np.nan
+            ds["temperature"].values = temp_vals
+            print(f"  Pre-clean: removed {n_preclean_temp} temperature values outside [-2.5, 35.0]°C")
+
     if CLEAN_MODE_YEAR and HAS_PANDAS:
         t_dt = pd.Series(ds.time.values)
         if len(t_dt) > 0:
@@ -250,13 +261,28 @@ def backscatter_zhang_correction(beta, temperature, salinity,
     return out
 
 
-def insitu_dark_count(data, depth, deep_min=200, deep_max=400, percentile=95):
+def insitu_dark_count(data, depth, deep_min=None, deep_max=None, percentile=5):
+    """
+    Subtract in-situ dark count (noise floor) from optical data.
+
+    Uses the 5th percentile of deep measurements as the dark offset
+    (standard practice per GliderTools / Briggs et al. 2011).
+
+    Depth range is adaptive: uses 70th-90th percentile of deployment depth
+    so it works for shallow coastal (100m) and deep (1000m+) deployments.
+    """
     valid = np.isfinite(data) & np.isfinite(depth)
+    if np.sum(valid) < 10:
+        return data, False
+
+    # Adaptive depth range based on deployment depth
+    if deep_min is None or deep_max is None:
+        deep_min = max(50, np.nanpercentile(depth[valid], 70))
+        deep_max = np.nanpercentile(depth[valid], 90)
+
     deep = valid & (depth >= deep_min) & (depth <= deep_max)
     used_fallback = False
     if np.sum(deep) < 5:
-        if np.sum(valid) < 10:
-            return data, False
         depth_thresh = np.percentile(depth[valid], 90)
         deep = valid & (depth >= depth_thresh)
         used_fallback = True
@@ -268,11 +294,26 @@ def insitu_dark_count(data, depth, deep_min=200, deep_max=400, percentile=95):
     return out, used_fallback
 
 
-def find_bad_profiles(data, depth, profile_index, depth_threshold=300, multiplier=2.0):
+def find_bad_profiles(data, depth, profile_index, depth_threshold=None, multiplier=2.0):
+    """
+    Find profiles with anomalously high deep values (biofouling, sensor drift).
+
+    depth_threshold is adaptive: defaults to 60th percentile of deployment depth,
+    with a minimum of 100m. This scales to the deployment depth automatically.
+    """
     mask = np.zeros(len(data), dtype=bool)
     valid = np.isfinite(data) & np.isfinite(depth) & np.isfinite(profile_index)
     if np.sum(valid) < 10:
         return mask, 0
+
+    # Adaptive depth threshold based on deployment depth
+    if depth_threshold is None:
+        finite_depth = depth[np.isfinite(depth)]
+        if len(finite_depth) > 0:
+            depth_threshold = max(100, np.nanpercentile(finite_depth, 60))
+        else:
+            depth_threshold = 100
+
     profiles = np.unique(profile_index[valid])
     deep_means = {}
     for p in profiles:
@@ -457,7 +498,8 @@ def apply_optics_correction(ds):
         for var in ["backscatter_700", "chlorophyll"]:
             if var in ds:
                 bad_mask, n_bad = find_bad_profiles(
-                    ds[var].values, depth, prof_idx, depth_threshold=300, multiplier=2.0)
+                    ds[var].values, depth, prof_idx,
+                    depth_threshold=None, multiplier=2.0)
                 if n_bad > 0:
                     vals = ds[var].values.copy()
                     vals[bad_mask] = np.nan
@@ -495,7 +537,7 @@ def apply_physics_qc(ds):
     # distribution is more uniform and global outliers are meaningful.
 
     phys_limits = {
-        "temperature":          (-2.5, 40.0),
+        "temperature":          (-2.5, 35.0),
         "salinity":             (2.0,  41.0),
         "oxygen_concentration": (-5.0, 600.0),
     }
@@ -541,12 +583,20 @@ def apply_physics_qc(ds):
         sal_depth = ds["depth"].values if "depth" in ds else ds["pressure"].values
         sal_mask, n_hdiff = horizontal_diff_outliers(
             ds["salinity"].values, sal_depth, ds["profile_index"].values,
-            max_frac=0.5, multiplier=6.0)
+            max_frac=0.3, multiplier=8.0)
         if n_hdiff > 0:
-            sal_vals = ds["salinity"].values.copy()
-            sal_vals[sal_mask] = np.nan
-            ds["salinity"].values = sal_vals
-            print(f"    salinity: horizontal diff flagged {n_hdiff} pts")
+            # Depth guard: only apply horizontal_diff_outliers below 100m.
+            # Surface salinity naturally has large horizontal gradients near
+            # coasts, river outflows, and fronts — don't flag those.
+            depth_guard = sal_depth > 100.0
+            sal_mask_guarded = sal_mask & depth_guard
+            n_applied = int(np.sum(sal_mask_guarded))
+            if n_applied > 0:
+                sal_vals = ds["salinity"].values.copy()
+                sal_vals[sal_mask_guarded] = np.nan
+                ds["salinity"].values = sal_vals
+            print(f"    salinity: horizontal diff flagged {n_hdiff} pts, "
+                  f"applied {n_applied} (depth>100m guard)")
 
     return ds
 
@@ -684,7 +734,18 @@ def test_global_range(ds, qc_dict):
     return flagged
 
 
-def test_pressure_increasing(ds, qc_dict, reversal_threshold=20.0):
+def test_pressure_increasing(ds, qc_dict, reversal_threshold=50.0):
+    """
+    Flag genuine pressure reversals within profiles.
+
+    Threshold increased to 50 dbar (from 20) because small jitter during
+    profile inflection is normal for Slocum gliders and doesn't invalidate
+    measurements. Only flag genuine reversals.
+
+    Flags pressure as "probably bad" (3) — NOT bad (4) — since the T/S
+    readings at these points may still be valid. The cascade step handles
+    propagation only for truly impossible pressure values.
+    """
     if "pressure" not in ds:
         return 0
     p = ds["pressure"].values.copy()
@@ -718,7 +779,9 @@ def test_pressure_increasing(ds, qc_dict, reversal_threshold=20.0):
                 running_max = max(running_max, p_seg[i])
     n_bad = int(np.sum(bad))
     if "pressure" in qc_dict:
-        qc_dict["pressure"][bad] = 4
+        # Flag as "probably bad" (3), not "bad" (4) — pressure jitter
+        # doesn't invalidate the measurement, just the depth assignment
+        qc_dict["pressure"][bad] = 3
     return n_bad
 
 
@@ -830,6 +893,15 @@ def test_density_inversion(ds, qc_dict, threshold=0.03):
 
 
 def test_gross_sensor_drift(ds, qc_dict):
+    """
+    Detect gross sensor drift by comparing deep-water means between consecutive
+    profiles. Uses a sliding window of 5 profiles to compute running baseline,
+    making it robust to real horizontal gradients (eddies, fronts).
+
+    Thresholds raised and flags set to "probably bad" (3) instead of "bad" (4)
+    because gliders traverse real ocean variability. Only flag when the jump
+    is clearly beyond natural variability.
+    """
     if "profile_index" not in ds:
         return 0
     profile_index = ds["profile_index"].values
@@ -854,28 +926,35 @@ def test_gross_sensor_drift(ds, qc_dict):
             deep_mask = p_valid & np.isfinite(p_temp) & (p_depth > np.nanmax(p_depth) - 100)
             if np.sum(deep_mask) >= 3:
                 deep_means_t[p] = np.nanmean(p_temp[deep_mask])
+
+    # Use sliding window of 5 profiles to compute running baseline
+    # This prevents flagging due to real gradual environmental changes
+    window_size = 5
+
     prof_list = sorted(deep_means_s.keys())
-    for i in range(1, len(prof_list)):
-        p_prev = prof_list[i - 1]
+    means_s_arr = np.array([deep_means_s[p] for p in prof_list])
+    for i in range(window_size, len(prof_list)):
         p_curr = prof_list[i]
-        if p_curr in deep_means_s and p_prev in deep_means_s:
-            delta_s = abs(deep_means_s[p_curr] - deep_means_s[p_prev])
-            if delta_s > 1.0:   # raised from 0.5 — real horizontal salinity gradients exist
-                p_mask = (profile_index == p_curr)
-                if "salinity" in qc_dict:
-                    qc_dict["salinity"][p_mask] = 3
-                flagged += int(np.sum(p_mask))
+        # Compare against median of previous window_size profiles
+        window_med = np.median(means_s_arr[max(0, i - window_size):i])
+        delta_s = abs(means_s_arr[i] - window_med)
+        if delta_s > 1.5:  # raised threshold — real ocean has gradients
+            p_mask = (profile_index == p_curr)
+            if "salinity" in qc_dict:
+                qc_dict["salinity"][p_mask] = np.maximum(qc_dict["salinity"][p_mask], 3)
+            flagged += int(np.sum(p_mask))
+
     prof_list_t = sorted(deep_means_t.keys())
-    for i in range(1, len(prof_list_t)):
-        p_prev = prof_list_t[i - 1]
+    means_t_arr = np.array([deep_means_t[p] for p in prof_list_t])
+    for i in range(window_size, len(prof_list_t)):
         p_curr = prof_list_t[i]
-        if p_curr in deep_means_t and p_prev in deep_means_t:
-            delta_t = abs(deep_means_t[p_curr] - deep_means_t[p_prev])
-            if delta_t > 3.0:   # raised from 1.0 — gliders cross real horizontal gradients
-                p_mask = (profile_index == p_curr)
-                if "temperature" in qc_dict:
-                    qc_dict["temperature"][p_mask] = 3
-                flagged += int(np.sum(p_mask))
+        window_med = np.median(means_t_arr[max(0, i - window_size):i])
+        delta_t = abs(means_t_arr[i] - window_med)
+        if delta_t > 4.0:  # raised threshold — gliders cross thermal fronts
+            p_mask = (profile_index == p_curr)
+            if "temperature" in qc_dict:
+                qc_dict["temperature"][p_mask] = np.maximum(qc_dict["temperature"][p_mask], 3)
+            flagged += int(np.sum(p_mask))
     return flagged
 
 
@@ -907,13 +986,26 @@ def test_deepest_pressure(ds, qc_dict, config_pressure_dbar=1000.0):
 
 
 def pressure_cascade(ds, qc_dict):
+    """
+    Cascade ONLY truly impossible pressure values (QC=4 from global range test)
+    to other variables. Do NOT cascade pressure-increasing flags (QC=3) — a
+    small pressure jitter during profile inflection doesn't invalidate the
+    temperature or oxygen readings at that point.
+
+    Only pressure Bad (4) and Missing (9) propagate to T/S/O2.
+    """
     if "pressure" not in qc_dict:
         return 0
+    # Only cascade Bad (4) from global_range, not probably_bad (3) from
+    # pressure_increasing. Missing (9) also cascades.
     pres_bad = (qc_dict["pressure"] == 4) | (qc_dict["pressure"] == 9)
     n_casc = 0
-    for var, qc in qc_dict.items():
-        if var == "pressure":
+    # Only cascade to physical variables that depend on pressure for context
+    cascade_vars = ["temperature", "salinity", "oxygen_concentration", "density"]
+    for var in cascade_vars:
+        if var not in qc_dict:
             continue
+        qc = qc_dict[var]
         cascade_mask = pres_bad & (qc != 4) & (qc != 9)
         n_casc += int(np.sum(cascade_mask))
         qc[cascade_mask] = 4
@@ -965,7 +1057,7 @@ def apply_argo_qc(ds, config_pressure_dbar=1000.0):
         print(f"   Test 19 (Deepest pressure):    flagged {n19}")
     nc = pressure_cascade(ds, qc_dict)
     if nc > 0:
-        print(f"   Cascade (PRES_QC -> all):      flagged {nc}")
+        print(f"   Cascade (PRES_QC=4 -> T/S/O2): flagged {nc}")
 
     if "temperature" in qc_dict and "salinity" in qc_dict:
         t_qc = qc_dict["temperature"]
