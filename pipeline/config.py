@@ -61,7 +61,7 @@ _BINARY_EXTS = (".dcd", ".ecd", ".dbd", ".ebd")
 # Processing parameters  (rarely need changing)
 # ============================================================
 DEPTH_BIN         = 1.0
-PLOT_DEPTH_MAX    = 1000.0
+PLOT_DEPTH_MAX    = None   # Auto-detect from data coverage (set a number to override)
 OXYGEN_TAU        = 30.0
 PROFILE_FILT_SECS = 100
 PROFILE_MIN_SECS  = 300

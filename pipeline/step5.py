@@ -30,7 +30,15 @@ GAP_THRESHOLD_HOURS = 48
 
 VARS_TO_PLOT = ["potential_temperature", "salinity",
                 "oxygen_concentration", "chlorophyll", "cdom"]
-CMAPS        = ["RdYlBu_r", "viridis", "viridis", "viridis", "viridis"]
+CMAPS        = ["RdYlBu_r", "viridis", "viridis", "viridis", "RdBu_r"]
+
+VAR_LABELS   = {
+    "potential_temperature": "water potential temperature [Celsius]",
+    "salinity":              "water salinity [1e-3]",
+    "oxygen_concentration":  "oxygen concentration [umol l-1]",
+    "chlorophyll":           "chlorophyll [mg m-3]",
+    "cdom":                  "CDOM [ppb]",
+}
 
 
 # ----------------------------------------------------------------
@@ -69,19 +77,53 @@ def _mask_time_gaps(data, time_values, gap_hours=GAP_THRESHOLD_HOURS):
     return masked
 
 
-def _max_data_depth(ds, vars_list, depth_vals):
-    """Find the deepest depth bin that has any valid data."""
-    max_d = 0.0
+def _max_data_depth(ds, vars_list, depth_vals, coverage_threshold=0.05):
+    """
+    Find the deepest depth bin with meaningful data coverage.
+
+    Instead of using the absolute deepest bin with *any* data (which picks up
+    isolated pressure spikes), this requires at least `coverage_threshold`
+    fraction of profiles to have data at a given depth.
+
+    Falls back to 99th percentile of depths with any data if the coverage
+    approach yields nothing.
+    """
     n_depth = len(depth_vals)
+    # Accumulate per-depth-bin profile counts across all variables
+    total_coverage = np.zeros(n_depth, dtype=float)
+    n_profiles_max = 0
+
     for var in vars_list:
         if var in ds:
             v = ds[var].values
-            # Only handle 2D (time × depth) variables
             if v.ndim == 2 and v.shape[1] == n_depth:
-                col_valid = np.any(np.isfinite(v), axis=0)
-                if np.any(col_valid):
-                    max_d = max(max_d, float(depth_vals[col_valid].max()))
-    return max_d if max_d > 10 else float(depth_vals.max())
+                n_profiles = v.shape[0]
+                n_profiles_max = max(n_profiles_max, n_profiles)
+                # Count how many profiles have data at each depth bin
+                col_counts = np.sum(np.isfinite(v), axis=0).astype(float)
+                total_coverage = np.maximum(total_coverage, col_counts)
+
+    if n_profiles_max == 0:
+        return float(depth_vals.max()) if len(depth_vals) > 0 else 1000.0
+
+    # Fraction of profiles with data at each depth
+    frac = total_coverage / n_profiles_max
+
+    # Find deepest bin where at least coverage_threshold fraction has data
+    bins_with_coverage = np.where(frac >= coverage_threshold)[0]
+    if len(bins_with_coverage) > 0:
+        max_d = float(depth_vals[bins_with_coverage[-1]])
+        # Add a small padding (10% or 20m, whichever is larger)
+        padding = max(20.0, max_d * 0.10)
+        max_d = min(max_d + padding, float(depth_vals.max()))
+        return max_d if max_d > 10 else float(depth_vals.max())
+
+    # Fallback: any bin with data at all
+    any_data = np.where(total_coverage > 0)[0]
+    if len(any_data) > 0:
+        return float(depth_vals[any_data[-1]])
+
+    return float(depth_vals.max()) if len(depth_vals) > 0 else 1000.0
 
 
 def _report_gaps(t_vals):
@@ -106,8 +148,17 @@ def _draw_pcolormesh(ax, t_vals, depth_vals, V, cmap, label, max_depth):
         return False
 
     depth_mask = depth_vals <= max_depth
-    V_trim = V[:, depth_mask]
+    V_trim = V[:, depth_mask].copy()
     d_trim = depth_vals[depth_mask]
+
+    # Suppress isolated depth artefacts: NaN out depth bins where fewer than
+    # 3% of profiles have data (removes pressure spike horizontal lines)
+    n_profiles = V_trim.shape[0]
+    if n_profiles > 5:
+        col_counts = np.sum(np.isfinite(V_trim), axis=0).astype(float)
+        sparse_bins = col_counts < (n_profiles * 0.03)
+        V_trim[:, sparse_bins] = np.nan
+
     V_trim = _mask_time_gaps(V_trim, t_vals, GAP_THRESHOLD_HOURS)
 
     valid = np.isfinite(V_trim)
@@ -128,11 +179,25 @@ def _draw_pcolormesh(ax, t_vals, depth_vals, V, cmap, label, max_depth):
 
     mesh = ax.pcolormesh(t_edges, d_edges, V_trim.T,
                          cmap=cmap, vmin=v_min, vmax=v_max, shading="flat")
+
+    # Add contour lines for structure (matching team's plot style)
+    try:
+        import numpy.ma as ma
+        V_ma = ma.masked_invalid(V_trim)
+        X, Y = np.meshgrid(mdates.date2num(t_vals), d_trim)
+        n_contours = 10
+        levels = np.linspace(v_min, v_max, n_contours)
+        ax.contour(X, Y, V_ma.T, levels=levels,
+                   colors="k", linewidths=0.4, alpha=0.5)
+    except Exception:
+        pass
+
     ax.set_ylim(max_depth, 0)
     ax.set_title(label, fontsize=13, fontweight="bold")
     ax.set_ylabel("Depth (m)", fontsize=11)
     cbar = plt.colorbar(mesh, ax=ax, pad=0.02)
-    cbar.set_label(label, fontsize=11)
+    cbar_label = VAR_LABELS.get(label, label)
+    cbar.set_label(cbar_label, fontsize=11)
     return True
 
 
@@ -149,6 +214,72 @@ def _finalise_fig(fig, axes, plot_path):
 # ----------------------------------------------------------------
 # L0 plot  — raw data, no QC masking
 # ----------------------------------------------------------------
+
+def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
+    """
+    Build a 2D grid from L1 timeseries, applying QC (flags 1 & 2 only).
+    Returns (grid_data dict, time_arr, depth_centers) or (None, None, None).
+    """
+    if depth_bin is None:
+        depth_bin = DEPTH_BIN
+
+    if "profile_index" not in l1_ds:
+        return None, None, None
+
+    pi_vals = l1_ds["profile_index"].values
+    unique_profiles = np.unique(pi_vals[np.isfinite(pi_vals)])
+
+    depth_raw = l1_ds["depth"].values if "depth" in l1_ds else None
+    if depth_raw is None:
+        return None, None, None
+
+    finite_depths = depth_raw[np.isfinite(depth_raw)]
+    if len(finite_depths) == 0:
+        return None, None, None
+    max_depth = float(np.percentile(finite_depths, 99.5))
+    if max_depth < 10:
+        max_depth = PLOT_DEPTH_MAX or 1000.0
+    depth_bins    = np.arange(0, max_depth + depth_bin, depth_bin)
+    depth_centers = depth_bins[:-1] + depth_bin / 2.0
+
+    gridded = {var: [] for var in VARS_TO_PLOT}
+    times   = []
+
+    for p_num in unique_profiles:
+        mask   = (pi_vals == p_num)
+        d_vals = depth_raw[mask]
+        t_vals = l1_ds.time.values[mask].astype("datetime64[s]").astype(float)
+        times.append(float(np.nanmean(t_vals)) if len(t_vals) > 0 else np.nan)
+
+        for var in VARS_TO_PLOT:
+            if var in l1_ds:
+                v_vals = l1_ds[var].values[mask]
+                # Apply QC: only keep flags 1 & 2
+                qc_var = f"{var}_QC"
+                if qc_var in l1_ds:
+                    qc = l1_ds[qc_var].values[mask].astype(int)
+                    qc_ok = (qc == 1) | (qc == 2)
+                else:
+                    qc_ok = np.ones(len(v_vals), dtype=bool)
+                valid = np.isfinite(d_vals) & np.isfinite(v_vals) & qc_ok
+                if np.sum(valid) > 0:
+                    stat, _, _ = binned_statistic(
+                        d_vals[valid], v_vals[valid],
+                        statistic="mean", bins=depth_bins)
+                    gridded[var].append(stat)
+                else:
+                    gridded[var].append(np.full(len(depth_centers), np.nan))
+            else:
+                gridded[var].append(np.full(len(depth_centers), np.nan))
+
+    time_arr = np.array(times).astype("datetime64[s]")
+    grid_2d  = {}
+    for var in VARS_TO_PLOT:
+        if var in l1_ds and len(gridded[var]) > 0:
+            grid_2d[var] = np.vstack(gridded[var])
+
+    return grid_2d, time_arr, depth_centers
+
 
 def _make_l0_grid(l0_ds, depth_bin=None):
     """
@@ -168,8 +299,13 @@ def _make_l0_grid(l0_ds, depth_bin=None):
     if depth_raw is None:
         return None, None, None
 
-    max_depth = float(np.nanmax(depth_raw))
-    if np.isnan(max_depth) or max_depth < 10:
+    # Use 99th percentile of actual depth values to avoid pressure spikes
+    # stretching the grid unnecessarily
+    finite_depths = depth_raw[np.isfinite(depth_raw)]
+    if len(finite_depths) == 0:
+        return None, None, None
+    max_depth = float(np.percentile(finite_depths, 99.5))
+    if max_depth < 10:
         max_depth = PLOT_DEPTH_MAX or 1000.0
     depth_bins    = np.arange(0, max_depth + depth_bin, depth_bin)
     depth_centers = depth_bins[:-1] + depth_bin / 2.0
@@ -230,15 +366,25 @@ def plot_l0(l0_path, plot_path=None):
 
     _report_gaps(t_arr)
 
+    # Determine max plot depth using coverage-based approach:
+    # only show depths where at least 5% of profiles have data
+    n_profiles = len(t_arr)
     max_depth = 0.0
     for var in VARS_TO_PLOT:
         if var in grid_2d:
             v = grid_2d[var]
-            col_valid = np.any(np.isfinite(v), axis=0)
-            if np.any(col_valid):
-                max_depth = max(max_depth, float(depth_centers[col_valid].max()))
+            # Count profiles with valid data at each depth bin
+            col_counts = np.sum(np.isfinite(v), axis=0).astype(float)
+            frac = col_counts / max(n_profiles, 1)
+            bins_ok = np.where(frac >= 0.05)[0]
+            if len(bins_ok) > 0:
+                max_depth = max(max_depth, float(depth_centers[bins_ok[-1]]))
     if max_depth < 10:
         max_depth = PLOT_DEPTH_MAX or 1000.0
+    else:
+        # Add padding (10% or 20m, whichever is larger)
+        padding = max(20.0, max_depth * 0.10)
+        max_depth = min(max_depth + padding, float(depth_centers.max()))
 
     print(f"  L0 plot depth: {max_depth:.0f} m")
 
@@ -273,20 +419,69 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
     plots_dir = os.path.join(OUTPUT_DIR, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    if grid_path is None:
-        grid_path = os.path.join(OUTPUT_DIR, "gridfiles",
-                                 f"incois_glider_{GLIDER_ID}_grid.nc")
+    # Try to find the grid file (multiple naming conventions)
+    if grid_path is None or not os.path.exists(grid_path):
+        # Search common grid file patterns
+        candidates = [
+            grid_path,
+            os.path.join(OUTPUT_DIR, "L1-gridfiles",
+                         f"incois_glider_{GLIDER_ID}_L1_grid.nc"),
+            os.path.join(OUTPUT_DIR, "gridfiles",
+                         f"incois_glider_{GLIDER_ID}_L1_grid.nc"),
+            os.path.join(OUTPUT_DIR, "gridfiles",
+                         f"incois_glider_{GLIDER_ID}_grid.nc"),
+        ]
+        grid_path = None
+        for c in candidates:
+            if c and os.path.exists(c):
+                grid_path = c
+                break
 
-    if os.path.exists(grid_path):
+    ds = None
+    is_1d = False
+
+    if grid_path and os.path.exists(grid_path):
         print(f"  Loading grid: {grid_path}")
         ds = xr.open_dataset(grid_path)
-        is_1d = False
-    elif l1_path is not None and os.path.exists(l1_path):
-        print(f"  Loading L1 (grid not found): {l1_path}")
+        # Verify it actually has 2D structure
+        if "depth" in ds and "time" in ds:
+            # Check that at least one science variable is 2D
+            has_2d = False
+            for var in VARS_TO_PLOT:
+                if var in ds and ds[var].ndim == 2:
+                    has_2d = True
+                    break
+            if not has_2d:
+                print(f"  WARNING: grid file has no 2D variables — "
+                      f"falling back to L1 timeseries")
+                ds.close()
+                ds = None
+
+    if ds is None and l1_path is not None and os.path.exists(l1_path):
+        print(f"  Loading L1 timeseries (grid not usable): {l1_path}")
         ds = xr.open_dataset(l1_path)
-        is_1d = ("depth" in ds and ds["depth"].ndim == 1
-                 and ds.depth.dims[0] == "time")
-    else:
+        # If it has profile_index and depth, build a grid on-the-fly
+        if "profile_index" in ds and "depth" in ds:
+            print(f"  Building L1 grid on-the-fly from timeseries...")
+            grid_2d, t_arr, depth_centers = _make_l1_grid_from_ts(ds)
+            if grid_2d is not None:
+                ds.close()
+                # Create a temporary xarray dataset from the grid
+                gds = xr.Dataset(coords={"time": t_arr, "depth": depth_centers})
+                for var in VARS_TO_PLOT:
+                    if var in grid_2d:
+                        gds[var] = xr.DataArray(grid_2d[var],
+                                                dims=["time", "depth"])
+                ds = gds
+                is_1d = False
+            else:
+                is_1d = ("depth" in ds and ds["depth"].ndim == 1
+                         and ds.depth.dims[0] == "time")
+        else:
+            is_1d = ("depth" in ds and ds["depth"].ndim == 1
+                     and ds.depth.dims[0] == "time")
+
+    if ds is None:
         print(f"  WARNING: no grid or L1 file found for L1 plot")
         return None
 
@@ -294,6 +489,13 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
         ds["potential_density"] = ds["density"]
 
     ds = ds.sortby("time")
+
+    # Diagnostic: show what's in the loaded dataset
+    if not is_1d:
+        print(f"  Grid dims: time={len(ds.time)} depth={len(ds.depth)}")
+        for var in VARS_TO_PLOT:
+            if var in ds:
+                print(f"    {var}: shape={ds[var].shape} dims={ds[var].dims}")
 
     if plot_path is None:
         plot_path = os.path.join(plots_dir,
@@ -329,12 +531,32 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
             continue
 
         V = ds[var].values
-        # Only plot 2D (time × depth) variables
-        if not is_1d and (V.ndim != 2 or V.shape != (len(t_vals), len(depth_vals))):
-            ax.set_title(f"{var} (NOT 2D)", fontsize=13)
-            ax.set_ylim(max_depth, 0)
-            ax.set_ylabel("Depth (m)", fontsize=11)
-            continue
+
+        # Handle variables that might have different dimension names
+        if not is_1d:
+            if V.ndim != 2:
+                # Try to reshape if it's a 1D variable in a grid dataset
+                # (shouldn't happen with make_grid output, but be defensive)
+                ax.set_title(f"{var} (NOT 2D: ndim={V.ndim})", fontsize=13)
+                ax.set_ylim(max_depth, 0)
+                ax.set_ylabel("Depth (m)", fontsize=11)
+                continue
+            # Accept any 2D variable — use its actual shape for depth axis
+            if V.shape[0] == len(t_vals) and V.shape[1] == len(depth_vals):
+                pass  # perfect match
+            elif V.shape[0] == len(t_vals):
+                # Depth dimension might differ — use variable's actual depth
+                # This handles cases where depth coord length doesn't match
+                print(f"    {var}: shape {V.shape} (depth_vals={len(depth_vals)})")
+                depth_vals_eff = np.arange(V.shape[1]) * DEPTH_BIN
+                _draw_pcolormesh(ax, t_vals, depth_vals_eff, V,
+                                 cmap, var, max_depth)
+                continue
+            else:
+                ax.set_title(f"{var} (shape mismatch: {V.shape})", fontsize=13)
+                ax.set_ylim(max_depth, 0)
+                ax.set_ylabel("Depth (m)", fontsize=11)
+                continue
 
         if is_1d:
             depth_1d = ds.depth.values

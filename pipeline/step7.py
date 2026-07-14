@@ -95,10 +95,30 @@ def _pcolor_edges(centers):
     return e
 
 
-def _max_data_depth(V, depth_vals):
-    """Find deepest depth bin with data. V must be (n_time, n_depth)."""
+def _max_data_depth(V, depth_vals, coverage_threshold=0.05):
+    """
+    Find deepest depth bin with meaningful data coverage.
+
+    Requires at least `coverage_threshold` fraction of profiles to have
+    data at a given depth. This avoids stretching plots to 1000 m because
+    of a single pressure spike at 900 m.
+    """
     if V.ndim != 2 or V.shape[1] != len(depth_vals):
         return float(depth_vals.max())
+
+    n_profiles = V.shape[0]
+    col_counts = np.sum(np.isfinite(V), axis=0).astype(float)
+    frac = col_counts / max(n_profiles, 1)
+
+    # Deepest bin where at least coverage_threshold fraction has data
+    bins_ok = np.where(frac >= coverage_threshold)[0]
+    if len(bins_ok) > 0:
+        max_d = float(depth_vals[bins_ok[-1]])
+        # Add padding (10% or 20m, whichever is larger)
+        padding = max(20.0, max_d * 0.10)
+        return min(max_d + padding, float(depth_vals.max()))
+
+    # Fallback: any bin with data
     col = np.any(np.isfinite(V), axis=0)
     return float(depth_vals[col].max()) if col.any() else float(depth_vals.max())
 
@@ -235,6 +255,7 @@ def _dual_contour_section(grid, var1, var2, titles, units,
         if v in grid:
             V = _get_2d(grid, v)
             if V is None:
+                print(f"  SKIP: {v} is not a 2D time×depth variable")
                 continue
             valid = V[np.isfinite(V)]
             vmin = np.nanpercentile(valid, 2) if len(valid) else 0
@@ -242,7 +263,7 @@ def _dual_contour_section(grid, var1, var2, titles, units,
             all_V.append((v, V, vmin, vmax))
 
     if not all_V:
-        print(f"  SKIP: no 2D data for {var1} or {var2}")
+        print(f"  SKIP: no usable 2D data for {var1} or {var2}")
         return None
 
     dm = D <= (depth_max or _max_data_depth(all_V[0][1], D))
