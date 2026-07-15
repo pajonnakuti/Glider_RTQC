@@ -19,6 +19,7 @@ from config import (
     CLEAN_FACTORY_TESTS, FACTORY_LAT_MIN, FACTORY_LAT_MAX,
     FACTORY_LON_MIN, FACTORY_LON_MAX, CLEAN_ZERO_GPS,
     CLEAN_HEMISPHERE, CLEAN_MODE_YEAR,
+    DEPLOY_TIME_START, DEPLOY_TIME_END,
 )
 
 try:
@@ -41,6 +42,24 @@ except ImportError:
 def pre_clean(ds):
     """Remove pre-deployment factory tests, zero GPS, and cross-hemisphere data."""
     n_orig = len(ds.time)
+
+    # ------------------------------------------------------------------
+    # 0. Time crop: if deployment start/end are known, cut everything
+    #    outside that window. This is the most reliable filter — it removes
+    #    factory test data, transit, ballasting, and post-recovery noise
+    #    in one clean cut.
+    # ------------------------------------------------------------------
+    if DEPLOY_TIME_START is not None or DEPLOY_TIME_END is not None:
+        time_mask = np.ones(len(ds.time), dtype=bool)
+        if DEPLOY_TIME_START is not None:
+            time_mask &= (ds.time.values >= DEPLOY_TIME_START)
+        if DEPLOY_TIME_END is not None:
+            time_mask &= (ds.time.values <= DEPLOY_TIME_END)
+        n_time_drop = int(np.sum(~time_mask))
+        if n_time_drop > 0:
+            ds = ds.isel(time=time_mask)
+            print(f"  Pre-clean: time crop [{DEPLOY_TIME_START} to {DEPLOY_TIME_END}] "
+                  f"removed {n_time_drop} observations")
 
     if "latitude" in ds and "longitude" in ds:
         if CLEAN_FACTORY_TESTS:

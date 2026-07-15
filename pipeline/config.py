@@ -99,6 +99,12 @@ CLEAN_ZERO_GPS   = True
 CLEAN_HEMISPHERE = True
 CLEAN_MODE_YEAR  = True
 
+# Deployment time window (from deployment.yml if available)
+# When set, pre_clean() will crop the timeseries to this window,
+# removing factory test, transit, and post-recovery data.
+DEPLOY_TIME_START = None   # np.datetime64 or None
+DEPLOY_TIME_END   = None   # np.datetime64 or None
+
 
 # ============================================================
 # Auto-detection helpers
@@ -156,9 +162,9 @@ def _gps_from_mlg_files(data_dir):
 
 
 def _deployment_dates_from_yaml(yaml_path):
-    """Return (start_year, end_year) from deployment.yml, or (None, None)."""
+    """Return (start_dt, end_dt, start_year, end_year) from deployment.yml."""
     if not os.path.exists(yaml_path):
-        return None, None
+        return None, None, None, None
     try:
         import yaml
         with open(yaml_path) as fh:
@@ -168,9 +174,22 @@ def _deployment_dates_from_yaml(yaml_path):
         end   = meta.get("deployment_end",   "")
         sy = int(start[:4]) if start and len(start) >= 4 else None
         ey = int(end[:4])   if end   and len(end)   >= 4 else None
-        return sy, ey
+        # Parse full datetime strings
+        start_dt = None
+        end_dt = None
+        if start:
+            try:
+                start_dt = np.datetime64(start.strip("'\""))
+            except Exception:
+                pass
+        if end:
+            try:
+                end_dt = np.datetime64(end.strip("'\""))
+            except Exception:
+                pass
+        return start_dt, end_dt, sy, ey
     except Exception:
-        return None, None
+        return None, None, None, None
 
 
 def _max_depth_from_yaml(yaml_path):
@@ -368,9 +387,18 @@ def detect_deployment(verbose=True):
               f"(source: {detected['max_depth_source']})")
 
     # ------------------------------------------------------------------
-    # 4. Deployment year (for CLEAN_MODE_YEAR)
+    # 4. Deployment time window and year (for time-cropping and CLEAN_MODE_YEAR)
     # ------------------------------------------------------------------
-    sy, ey = _deployment_dates_from_yaml(DEPLOY_YAML)
+    global DEPLOY_TIME_START, DEPLOY_TIME_END
+
+    start_dt, end_dt, sy, ey = _deployment_dates_from_yaml(DEPLOY_YAML)
+    if start_dt is not None:
+        DEPLOY_TIME_START = start_dt
+        detected["deployment_start"] = str(start_dt)
+    if end_dt is not None:
+        DEPLOY_TIME_END = end_dt
+        detected["deployment_end"] = str(end_dt)
+
     if sy is not None:
         detected["deployment_year"] = sy
         detected["deployment_year_source"] = "deployment.yml"
@@ -387,6 +415,8 @@ def detect_deployment(verbose=True):
         yr_info = detected.get("deployment_year", "unknown")
         print(f"    Deployment year: {yr_info}  "
               f"(source: {detected['deployment_year_source']})")
+        if DEPLOY_TIME_START or DEPLOY_TIME_END:
+            print(f"    Deployment window: {DEPLOY_TIME_START} to {DEPLOY_TIME_END}")
 
     return detected
 

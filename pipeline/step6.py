@@ -516,7 +516,7 @@ def write_summary_report(l0_path, l1_path, grid_path, report_path=None):
     w(f"  Pipeline outputs in: {OUTPUT_DIR}")
     w("=" * 70)
 
-    with open(report_path, "w") as fh:
+    with open(report_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
     print(f"  Summary report saved: {report_path}")
@@ -807,7 +807,7 @@ def run_gt_comparison(l0_path, l1_path, report_path=None):
     w("  Our per-profile ARGO approach avoids this issue.")
     w("=" * 65)
 
-    with open(report_path, "w") as fh:
+    with open(report_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
     # Print key lines to console

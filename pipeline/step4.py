@@ -19,15 +19,16 @@ import sys
 import time
 import numpy as np
 import xarray as xr
-from scipy.stats import binned_statistic
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import OUTPUT_DIR, GLIDER_ID, DEPTH_BIN
 
 # Variables excluded from gridding (not continuous physical quantities)
+# "depth" MUST be excluded — it's used as the grid coordinate and must stay 1D
 _SKIP_GRID_VARS = {
     "profile_index", "profile_direction", "distance_over_ground",
     "mission_number", "profile_time_start", "profile_time_end",
+    "depth",
 }
 
 
@@ -119,16 +120,66 @@ def split_profiles(nc_path, out_dir, base_name, apply_qc=False):
 
 # ── Grid generation ─────────────────────────────────────────────
 
+def _interp_profile_to_grid(d_arr, v_arr, depth_centers):
+    """
+    Interpolate a single profile onto the regular depth grid.
+
+    Uses linear interpolation between measurements — this is correct because
+    glider data is essentially a continuous profile sampled every few meters.
+    Only interpolates WITHIN the measured depth range (no extrapolation).
+
+    Returns array of length len(depth_centers) with NaN outside data range.
+    """
+    from scipy.interpolate import interp1d
+
+    # Sort by depth (profiles can be ascending or descending)
+    order = np.argsort(d_arr)
+    d_sorted = d_arr[order]
+    v_sorted = v_arr[order]
+
+    # Remove duplicate depths (average values at same depth)
+    _, unique_idx = np.unique(d_sorted, return_index=True)
+    if len(unique_idx) < len(d_sorted):
+        # There are duplicates — use binned mean at each unique depth
+        d_unique = d_sorted[unique_idx]
+        v_unique = np.empty(len(d_unique))
+        for j, idx in enumerate(unique_idx):
+            next_idx = unique_idx[j + 1] if j + 1 < len(unique_idx) else len(d_sorted)
+            v_unique[j] = np.nanmean(v_sorted[idx:next_idx])
+        d_sorted = d_unique
+        v_sorted = v_unique
+
+    if len(d_sorted) < 2:
+        # Can't interpolate with fewer than 2 points
+        result = np.full(len(depth_centers), np.nan)
+        if len(d_sorted) == 1:
+            # Place single point in nearest bin
+            idx = np.argmin(np.abs(depth_centers - d_sorted[0]))
+            result[idx] = v_sorted[0]
+        return result
+
+    # Interpolate — only within the measured depth range (bounds_error=False
+    # with fill_value=nan means no extrapolation beyond data)
+    f = interp1d(d_sorted, v_sorted, kind='linear',
+                 bounds_error=False, fill_value=np.nan)
+    return f(depth_centers)
+
+
 def make_grid(nc_path, out_dir, grid_filename, apply_qc=False):
     """
-    Bin a timeseries NetCDF into a 2D time×depth grid.
+    Interpolate a timeseries NetCDF into a 2D time x depth grid.
+
+    Each profile is linearly interpolated onto a regular 1m depth grid.
+    This matches what pyglider does — glider measurements are continuous
+    profiles sampled every few meters, so linear interpolation between
+    points is physically correct.
 
     Parameters
     ----------
     nc_path        : path to input timeseries NetCDF
     out_dir        : directory where the grid is written
     grid_filename  : output filename (e.g. "incois_glider_890_2023_L1_grid.nc")
-    apply_qc       : if True, only flag 1/2 values go into the depth bins
+    apply_qc       : if True, only flag 1/2 values go into the grid
 
     Returns
     -------
@@ -151,11 +202,10 @@ def make_grid(nc_path, out_dir, grid_filename, apply_qc=False):
     max_depth = float(np.nanmax(ds.depth.values))
     if np.isnan(max_depth) or max_depth < 10:
         max_depth = 1000.0
-    depth_bins    = np.arange(0, max_depth + DEPTH_BIN, DEPTH_BIN)
-    depth_centers = depth_bins[:-1] + DEPTH_BIN / 2.0
+    depth_centers = np.arange(DEPTH_BIN / 2.0, max_depth + DEPTH_BIN / 2.0, DEPTH_BIN)
     label = "QC flags 1&2" if apply_qc else "all finite values"
-    print(f"  Grid: {n} profiles × {len(depth_centers)} depth bins "
-          f"(0–{max_depth:.0f} m, dz={DEPTH_BIN}m, {label})")
+    print(f"  Grid: {n} profiles x {len(depth_centers)} depth bins "
+          f"(0-{max_depth:.0f} m, dz={DEPTH_BIN}m, {label})")
 
     # QC masks (built once over full dataset)
     qc_masks = {}
@@ -187,10 +237,16 @@ def make_grid(nc_path, out_dir, grid_filename, apply_qc=False):
             else:
                 qc_ok = np.ones(len(v_arr), dtype=bool)
             good = np.isfinite(d_arr) & np.isfinite(v_arr) & qc_ok
-            if good.sum() > 0:
-                stat, _, _ = binned_statistic(
-                    d_arr[good], v_arr[good], statistic="mean", bins=depth_bins)
-                gridded[var].append(stat)
+            if good.sum() >= 2:
+                # Interpolate profile onto regular depth grid
+                gridded[var].append(
+                    _interp_profile_to_grid(d_arr[good], v_arr[good],
+                                            depth_centers))
+            elif good.sum() == 1:
+                row = np.full(len(depth_centers), np.nan)
+                idx = np.argmin(np.abs(depth_centers - d_arr[good][0]))
+                row[idx] = v_arr[good][0]
+                gridded[var].append(row)
             else:
                 gridded[var].append(np.full(len(depth_centers), np.nan))
 

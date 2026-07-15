@@ -47,6 +47,8 @@ parser.add_argument("--l0-path",    default=None,
                          "Skips Step 1 (binary decode) automatically.")
 parser.add_argument("--skip-step1", action="store_true",
                     help="Skip binary decode — use existing L0 timeseries")
+parser.add_argument("--deploy-yml", default=None,
+                    help="Path to deployment.yml (if not in data-dir)")
 _args, _ = parser.parse_known_args()
 
 if _args.data_dir:
@@ -66,6 +68,9 @@ if "GLIDER_DATA_DIR" in os.environ:
 
 if _args.output_dir:
     _cfg.OUTPUT_DIR = os.path.abspath(_args.output_dir)
+
+if _args.deploy_yml:
+    _cfg.DEPLOY_YAML = os.path.abspath(_args.deploy_yml)
 
 from config import (
     OUTPUT_DIR, GLIDER_ID, print_config, ensure_dirs,

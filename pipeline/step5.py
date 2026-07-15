@@ -20,7 +20,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from scipy.stats import binned_statistic
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import OUTPUT_DIR, GLIDER_ID, PLOT_DEPTH_MAX, DEPTH_BIN
@@ -239,8 +238,7 @@ def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
     max_depth = float(np.percentile(finite_depths, 99.5))
     if max_depth < 10:
         max_depth = PLOT_DEPTH_MAX or 1000.0
-    depth_bins    = np.arange(0, max_depth + depth_bin, depth_bin)
-    depth_centers = depth_bins[:-1] + depth_bin / 2.0
+    depth_centers = np.arange(depth_bin / 2.0, max_depth + depth_bin / 2.0, depth_bin)
 
     gridded = {var: [] for var in VARS_TO_PLOT}
     times   = []
@@ -262,11 +260,15 @@ def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
                 else:
                     qc_ok = np.ones(len(v_vals), dtype=bool)
                 valid = np.isfinite(d_vals) & np.isfinite(v_vals) & qc_ok
-                if np.sum(valid) > 0:
-                    stat, _, _ = binned_statistic(
-                        d_vals[valid], v_vals[valid],
-                        statistic="mean", bins=depth_bins)
-                    gridded[var].append(stat)
+                if np.sum(valid) >= 2:
+                    gridded[var].append(
+                        _interp_profile(d_vals[valid], v_vals[valid],
+                                        depth_centers))
+                elif np.sum(valid) == 1:
+                    row = np.full(len(depth_centers), np.nan)
+                    idx = np.argmin(np.abs(depth_centers - d_vals[valid][0]))
+                    row[idx] = v_vals[valid][0]
+                    gridded[var].append(row)
                 else:
                     gridded[var].append(np.full(len(depth_centers), np.nan))
             else:
@@ -281,9 +283,41 @@ def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
     return grid_2d, time_arr, depth_centers
 
 
+def _interp_profile(d_vals, v_vals, depth_centers):
+    """Interpolate a single profile onto regular depth grid (linear, no extrapolation)."""
+    from scipy.interpolate import interp1d
+
+    order = np.argsort(d_vals)
+    d_sorted = d_vals[order]
+    v_sorted = v_vals[order]
+
+    # Remove duplicate depths
+    _, unique_idx = np.unique(d_sorted, return_index=True)
+    if len(unique_idx) < len(d_sorted):
+        d_unique = d_sorted[unique_idx]
+        v_unique = np.empty(len(d_unique))
+        for j, idx in enumerate(unique_idx):
+            next_idx = unique_idx[j + 1] if j + 1 < len(unique_idx) else len(d_sorted)
+            v_unique[j] = np.nanmean(v_sorted[idx:next_idx])
+        d_sorted = d_unique
+        v_sorted = v_unique
+
+    if len(d_sorted) < 2:
+        result = np.full(len(depth_centers), np.nan)
+        if len(d_sorted) == 1:
+            idx = np.argmin(np.abs(depth_centers - d_sorted[0]))
+            result[idx] = v_sorted[0]
+        return result
+
+    f = interp1d(d_sorted, v_sorted, kind='linear',
+                 bounds_error=False, fill_value=np.nan)
+    return f(depth_centers)
+
+
 def _make_l0_grid(l0_ds, depth_bin=None):
     """
     Build a quick 2D grid from the L0 timeseries (all finite values, no QC).
+    Uses linear interpolation within each profile to fill the depth grid.
     Returns (grid_data dict, time_arr, depth_centers).
     """
     if depth_bin is None:
@@ -307,8 +341,7 @@ def _make_l0_grid(l0_ds, depth_bin=None):
     max_depth = float(np.percentile(finite_depths, 99.5))
     if max_depth < 10:
         max_depth = PLOT_DEPTH_MAX or 1000.0
-    depth_bins    = np.arange(0, max_depth + depth_bin, depth_bin)
-    depth_centers = depth_bins[:-1] + depth_bin / 2.0
+    depth_centers = np.arange(depth_bin / 2.0, max_depth + depth_bin / 2.0, depth_bin)
 
     gridded = {var: [] for var in VARS_TO_PLOT}
     times   = []
@@ -323,11 +356,15 @@ def _make_l0_grid(l0_ds, depth_bin=None):
             if var in l0_ds:
                 v_vals = l0_ds[var].values[mask]
                 valid  = np.isfinite(d_vals) & np.isfinite(v_vals)
-                if np.sum(valid) > 0:
-                    stat, _, _ = binned_statistic(
-                        d_vals[valid], v_vals[valid],
-                        statistic="mean", bins=depth_bins)
-                    gridded[var].append(stat)
+                if np.sum(valid) >= 2:
+                    gridded[var].append(
+                        _interp_profile(d_vals[valid], v_vals[valid],
+                                        depth_centers))
+                elif np.sum(valid) == 1:
+                    row = np.full(len(depth_centers), np.nan)
+                    idx = np.argmin(np.abs(depth_centers - d_vals[valid][0]))
+                    row[idx] = v_vals[valid][0]
+                    gridded[var].append(row)
                 else:
                     gridded[var].append(np.full(len(depth_centers), np.nan))
             else:
