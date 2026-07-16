@@ -65,10 +65,24 @@ def pre_clean(ds):
         if CLEAN_FACTORY_TESTS:
             mask = ~((ds.latitude > FACTORY_LAT_MIN) & (ds.latitude < FACTORY_LAT_MAX)
                      & (ds.longitude > FACTORY_LON_MIN) & (ds.longitude < FACTORY_LON_MAX))
-            ds = ds.where(mask, drop=True)
+            n_factory = int(np.sum(~mask.values))
+            if n_factory > 0:
+                ds = ds.where(mask, drop=True)
+                print(f"  Pre-clean: factory test filter removed {n_factory} observations")
 
         if CLEAN_ZERO_GPS:
-            ds = ds.where(~((ds.latitude == 0) & (ds.longitude == 0)), drop=True)
+            # NaN out zero-GPS coordinates instead of dropping observations.
+            # Subsurface data is still valid even without a GPS fix.
+            zero_gps = (ds.latitude.values == 0) & (ds.longitude.values == 0)
+            n_zero = int(np.sum(zero_gps))
+            if n_zero > 0:
+                lat_vals = ds.latitude.values.copy().astype(float)
+                lon_vals = ds.longitude.values.copy().astype(float)
+                lat_vals[zero_gps] = np.nan
+                lon_vals[zero_gps] = np.nan
+                ds["latitude"].values = lat_vals
+                ds["longitude"].values = lon_vals
+                print(f"  Pre-clean: NaN'd {n_zero} zero-GPS positions")
 
     if "waypoint_latitude" in ds and "waypoint_longitude" in ds:
         if CLEAN_FACTORY_TESTS:
@@ -93,23 +107,33 @@ def pre_clean(ds):
             print(f"  Pre-clean: removed {n_preclean_temp} temperature values outside [-2.5, 35.0]°C")
 
     if CLEAN_MODE_YEAR and HAS_PANDAS:
+        n_before_year = len(ds.time)
         t_dt = pd.Series(ds.time.values)
         if len(t_dt) > 0:
             mode_year = t_dt.dt.year.mode()[0]
             ds = ds.sel(time=((ds.time.dt.year == mode_year) | (ds.time.dt.year == mode_year - 1)))
+        n_year_drop = n_before_year - len(ds.time)
+        if n_year_drop > 0:
+            print(f"  Pre-clean: mode year filter (keep {mode_year-1}-{mode_year}) "
+                  f"removed {n_year_drop} observations")
 
     if CLEAN_HEMISPHERE and "latitude" in ds:
-        median_lat = float(np.nanmedian(ds.latitude.values))
+        n_before_hemi = len(ds.time)
+        lat_vals = ds.latitude.values
+        median_lat = float(np.nanmedian(lat_vals))
+        # Only drop points with FINITE latitude in the wrong hemisphere.
+        # Keep NaN latitudes (subsurface observations not yet interpolated).
         if median_lat < 0:
-            ds = ds.where(ds.latitude < 0, drop=True)
-            if "waypoint_latitude" in ds:
-                ds["waypoint_latitude"] = ds["waypoint_latitude"].where(ds["waypoint_latitude"] < 0)
-                ds["waypoint_longitude"] = ds["waypoint_longitude"].where(ds["waypoint_latitude"] < 0)
+            wrong_hemi = np.isfinite(lat_vals) & (lat_vals > 0)
         else:
-            ds = ds.where(ds.latitude > 0, drop=True)
-            if "waypoint_latitude" in ds:
-                ds["waypoint_latitude"] = ds["waypoint_latitude"].where(ds["waypoint_latitude"] > 0)
-                ds["waypoint_longitude"] = ds["waypoint_longitude"].where(ds["waypoint_latitude"] > 0)
+            wrong_hemi = np.isfinite(lat_vals) & (lat_vals < 0)
+        if np.any(wrong_hemi):
+            ds = ds.isel(time=~wrong_hemi)
+        # Also keep lat==0 (equator or unset) — don't drop those
+        n_hemi_drop = n_before_hemi - len(ds.time)
+        if n_hemi_drop > 0:
+            print(f"  Pre-clean: hemisphere filter (median_lat={median_lat:.2f}) "
+                  f"removed {n_hemi_drop} observations")
 
     n_clean = len(ds.time)
     print(f"  Pre-cleaning: {n_orig} -> {n_clean} observations (removed {n_orig - n_clean})")
