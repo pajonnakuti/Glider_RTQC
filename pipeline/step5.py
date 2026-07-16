@@ -76,38 +76,18 @@ def _mask_time_gaps(data, time_values, gap_hours=GAP_THRESHOLD_HOURS):
     return masked
 
 
-def _max_data_depth(ds, vars_list, depth_vals, coverage_threshold=0.20):
+def _max_data_depth(ds, vars_list, depth_vals, coverage_threshold=0.10):
     """
     Find the deepest depth bin with meaningful data coverage.
 
-    Uses the 90th percentile of per-profile max depths from optics variables
-    (chlorophyll, cdom) if available, otherwise falls back to all variables.
-    This prevents interpolation artefacts from stretching the plot.
+    Universal approach: deepest bin where at least `coverage_threshold`
+    fraction of profiles have data. With bin-averaging (no interpolation),
+    this works correctly for any glider depth range.
     """
     n_depth = len(depth_vals)
-
-    # Prefer optics variables for depth limit
-    optics_vars = [v for v in ["chlorophyll", "cdom"] if v in ds]
-    source_vars = optics_vars if optics_vars else vars_list
-
-    all_max_depths = []
-    for var in source_vars:
-        if var in ds:
-            v = ds[var].values
-            if v.ndim == 2 and v.shape[1] == n_depth:
-                for row in v:
-                    finite_idx = np.where(np.isfinite(row))[0]
-                    if len(finite_idx) > 0:
-                        all_max_depths.append(float(depth_vals[finite_idx[-1]]))
-
-    if all_max_depths:
-        max_d = float(np.percentile(all_max_depths, 90))
-        padding = max(10.0, max_d * 0.10)
-        return max_d + padding
-
-    # Fallback: coverage-based
     total_coverage = np.zeros(n_depth, dtype=float)
     n_profiles_max = 0
+
     for var in vars_list:
         if var in ds:
             v = ds[var].values
@@ -124,8 +104,13 @@ def _max_data_depth(ds, vars_list, depth_vals, coverage_threshold=0.20):
     bins_with_coverage = np.where(frac >= coverage_threshold)[0]
     if len(bins_with_coverage) > 0:
         max_d = float(depth_vals[bins_with_coverage[-1]])
-        padding = max(10.0, max_d * 0.10)
-        return max_d + padding
+        padding = max(10.0, max_d * 0.05)
+        return min(max_d + padding, float(depth_vals.max()))
+
+    # Fallback: any bin with data
+    any_data = np.where(total_coverage > 0)[0]
+    if len(any_data) > 0:
+        return float(depth_vals[any_data[-1]])
 
     return float(depth_vals.max()) if len(depth_vals) > 0 else 1000.0
 
@@ -266,15 +251,10 @@ def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
                 else:
                     qc_ok = np.ones(len(v_vals), dtype=bool)
                 valid = np.isfinite(d_vals) & np.isfinite(v_vals) & qc_ok
-                if np.sum(valid) >= 2:
+                if np.sum(valid) > 0:
                     gridded[var].append(
                         _interp_profile(d_vals[valid], v_vals[valid],
                                         depth_centers))
-                elif np.sum(valid) == 1:
-                    row = np.full(len(depth_centers), np.nan)
-                    idx = np.argmin(np.abs(depth_centers - d_vals[valid][0]))
-                    row[idx] = v_vals[valid][0]
-                    gridded[var].append(row)
                 else:
                     gridded[var].append(np.full(len(depth_centers), np.nan))
             else:
@@ -349,15 +329,10 @@ def _make_l0_grid(l0_ds, depth_bin=None):
             if var in l0_ds:
                 v_vals = l0_ds[var].values[mask]
                 valid  = np.isfinite(d_vals) & np.isfinite(v_vals)
-                if np.sum(valid) >= 2:
+                if np.sum(valid) > 0:
                     gridded[var].append(
                         _interp_profile(d_vals[valid], v_vals[valid],
                                         depth_centers))
-                elif np.sum(valid) == 1:
-                    row = np.full(len(depth_centers), np.nan)
-                    idx = np.argmin(np.abs(depth_centers - d_vals[valid][0]))
-                    row[idx] = v_vals[valid][0]
-                    gridded[var].append(row)
                 else:
                     gridded[var].append(np.full(len(depth_centers), np.nan))
             else:
@@ -396,36 +371,26 @@ def plot_l0(l0_path, plot_path=None):
 
     _report_gaps(t_arr)
 
-    # Determine max plot depth.
-    # Strategy: Use the 90th percentile of per-profile max depths,
-    # computed from the OPTICS sensors (chlorophyll, cdom) which have a
-    # natural depth limit. If optics aren't available, fall back to all vars.
-    # This matches the team's convention of showing the bio-relevant depth.
+    # Determine max plot depth — universal approach:
+    # Find the deepest depth bin where at least 10% of profiles have data.
+    # With bin-averaging (no interpolation), only bins with actual
+    # measurements are non-NaN, so this works for any depth range.
     n_profiles = len(t_arr)
     max_depth = 0.0
-
-    # First try optics-based depth limit
-    optics_vars = [v for v in ["chlorophyll", "cdom"] if v in grid_2d]
-    depth_source_vars = optics_vars if optics_vars else \
-        [v for v in VARS_TO_PLOT if v in grid_2d]
-
-    all_max_depths = []
-    for var in depth_source_vars:
-        v = grid_2d[var]
-        for row in v:
-            finite_idx = np.where(np.isfinite(row))[0]
-            if len(finite_idx) > 0:
-                all_max_depths.append(float(depth_centers[finite_idx[-1]]))
-
-    if all_max_depths:
-        # 90th percentile of per-profile max depths
-        max_depth = float(np.percentile(all_max_depths, 90))
-        # Add padding
-        padding = max(10.0, max_depth * 0.10)
-        max_depth = max_depth + padding
-
+    for var in VARS_TO_PLOT:
+        if var in grid_2d:
+            v = grid_2d[var]
+            col_counts = np.sum(np.isfinite(v), axis=0).astype(float)
+            frac = col_counts / max(n_profiles, 1)
+            bins_ok = np.where(frac >= 0.10)[0]
+            if len(bins_ok) > 0:
+                max_depth = max(max_depth, float(depth_centers[bins_ok[-1]]))
     if max_depth < 10:
-        max_depth = PLOT_DEPTH_MAX or 1000.0
+        max_depth = float(depth_centers.max())
+    else:
+        # Add small padding
+        padding = max(10.0, max_depth * 0.05)
+        max_depth = min(max_depth + padding, float(depth_centers.max()))
 
     print(f"  L0 plot depth: {max_depth:.0f} m")
 

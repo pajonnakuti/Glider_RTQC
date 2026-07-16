@@ -95,38 +95,27 @@ def _pcolor_edges(centers):
     return e
 
 
-def _max_data_depth(V, depth_vals, coverage_threshold=0.20):
+def _max_data_depth(V, depth_vals, coverage_threshold=0.10):
     """
     Find deepest depth bin with meaningful data coverage.
 
-    Uses 90th percentile of per-profile max depths to avoid
-    stretching plots due to a few deep profiles or pressure spikes.
+    Universal: deepest bin where at least `coverage_threshold` fraction
+    of profiles have actual data. Works for any glider depth range.
     """
     if V.ndim != 2 or V.shape[1] != len(depth_vals):
         return float(depth_vals.max())
 
-    # Per-profile max depth
-    all_max_depths = []
-    for row in V:
-        finite_idx = np.where(np.isfinite(row))[0]
-        if len(finite_idx) > 0:
-            all_max_depths.append(float(depth_vals[finite_idx[-1]]))
-
-    if all_max_depths:
-        max_d = float(np.percentile(all_max_depths, 90))
-        padding = max(10.0, max_d * 0.10)
-        return min(max_d + padding, float(depth_vals.max()))
-
-    # Fallback: coverage-based
     n_profiles = V.shape[0]
     col_counts = np.sum(np.isfinite(V), axis=0).astype(float)
     frac = col_counts / max(n_profiles, 1)
+
     bins_ok = np.where(frac >= coverage_threshold)[0]
     if len(bins_ok) > 0:
         max_d = float(depth_vals[bins_ok[-1]])
-        padding = max(10.0, max_d * 0.10)
+        padding = max(10.0, max_d * 0.05)
         return min(max_d + padding, float(depth_vals.max()))
 
+    # Fallback: any bin with data
     col = np.any(np.isfinite(V), axis=0)
     return float(depth_vals[col].max()) if col.any() else float(depth_vals.max())
 
