@@ -76,51 +76,56 @@ def _mask_time_gaps(data, time_values, gap_hours=GAP_THRESHOLD_HOURS):
     return masked
 
 
-def _max_data_depth(ds, vars_list, depth_vals, coverage_threshold=0.05):
+def _max_data_depth(ds, vars_list, depth_vals, coverage_threshold=0.20):
     """
     Find the deepest depth bin with meaningful data coverage.
 
-    Instead of using the absolute deepest bin with *any* data (which picks up
-    isolated pressure spikes), this requires at least `coverage_threshold`
-    fraction of profiles to have data at a given depth.
-
-    Falls back to 99th percentile of depths with any data if the coverage
-    approach yields nothing.
+    Uses the 90th percentile of per-profile max depths from optics variables
+    (chlorophyll, cdom) if available, otherwise falls back to all variables.
+    This prevents interpolation artefacts from stretching the plot.
     """
     n_depth = len(depth_vals)
-    # Accumulate per-depth-bin profile counts across all variables
+
+    # Prefer optics variables for depth limit
+    optics_vars = [v for v in ["chlorophyll", "cdom"] if v in ds]
+    source_vars = optics_vars if optics_vars else vars_list
+
+    all_max_depths = []
+    for var in source_vars:
+        if var in ds:
+            v = ds[var].values
+            if v.ndim == 2 and v.shape[1] == n_depth:
+                for row in v:
+                    finite_idx = np.where(np.isfinite(row))[0]
+                    if len(finite_idx) > 0:
+                        all_max_depths.append(float(depth_vals[finite_idx[-1]]))
+
+    if all_max_depths:
+        max_d = float(np.percentile(all_max_depths, 90))
+        padding = max(10.0, max_d * 0.10)
+        return max_d + padding
+
+    # Fallback: coverage-based
     total_coverage = np.zeros(n_depth, dtype=float)
     n_profiles_max = 0
-
     for var in vars_list:
         if var in ds:
             v = ds[var].values
             if v.ndim == 2 and v.shape[1] == n_depth:
                 n_profiles = v.shape[0]
                 n_profiles_max = max(n_profiles_max, n_profiles)
-                # Count how many profiles have data at each depth bin
                 col_counts = np.sum(np.isfinite(v), axis=0).astype(float)
                 total_coverage = np.maximum(total_coverage, col_counts)
 
     if n_profiles_max == 0:
         return float(depth_vals.max()) if len(depth_vals) > 0 else 1000.0
 
-    # Fraction of profiles with data at each depth
     frac = total_coverage / n_profiles_max
-
-    # Find deepest bin where at least coverage_threshold fraction has data
     bins_with_coverage = np.where(frac >= coverage_threshold)[0]
     if len(bins_with_coverage) > 0:
         max_d = float(depth_vals[bins_with_coverage[-1]])
-        # Add a small padding (10% or 20m, whichever is larger)
-        padding = max(20.0, max_d * 0.10)
-        max_d = min(max_d + padding, float(depth_vals.max()))
-        return max_d if max_d > 10 else float(depth_vals.max())
-
-    # Fallback: any bin with data at all
-    any_data = np.where(total_coverage > 0)[0]
-    if len(any_data) > 0:
-        return float(depth_vals[any_data[-1]])
+        padding = max(10.0, max_d * 0.10)
+        return max_d + padding
 
     return float(depth_vals.max()) if len(depth_vals) > 0 else 1000.0
 
@@ -151,11 +156,12 @@ def _draw_pcolormesh(ax, t_vals, depth_vals, V, cmap, label, max_depth):
     d_trim = depth_vals[depth_mask]
 
     # Suppress isolated depth artefacts: NaN out depth bins where fewer than
-    # 3% of profiles have data (removes pressure spike horizontal lines)
+    # 10% of profiles have data (removes interpolation artefacts and pressure
+    # spike horizontal lines)
     n_profiles = V_trim.shape[0]
     if n_profiles > 5:
         col_counts = np.sum(np.isfinite(V_trim), axis=0).astype(float)
-        sparse_bins = col_counts < (n_profiles * 0.03)
+        sparse_bins = col_counts < max(n_profiles * 0.10, 3)
         V_trim[:, sparse_bins] = np.nan
 
     V_trim = _mask_time_gaps(V_trim, t_vals, GAP_THRESHOLD_HOURS)
@@ -284,34 +290,21 @@ def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
 
 
 def _interp_profile(d_vals, v_vals, depth_centers):
-    """Interpolate a single profile onto regular depth grid (linear, no extrapolation)."""
-    from scipy.interpolate import interp1d
+    """
+    Bin-average a single profile onto regular depth grid.
+    Only fills bins where actual measurements exist — NO interpolation
+    into unmeasured depths. This is critical for correct depth-limit detection.
+    """
+    depth_bin = depth_centers[1] - depth_centers[0] if len(depth_centers) > 1 else 1.0
+    result = np.full(len(depth_centers), np.nan)
 
-    order = np.argsort(d_vals)
-    d_sorted = d_vals[order]
-    v_sorted = v_vals[order]
+    for i, dc in enumerate(depth_centers):
+        # Find measurements within this depth bin
+        in_bin = (d_vals >= dc - depth_bin / 2.0) & (d_vals < dc + depth_bin / 2.0)
+        if np.any(in_bin):
+            result[i] = np.nanmean(v_vals[in_bin])
 
-    # Remove duplicate depths
-    _, unique_idx = np.unique(d_sorted, return_index=True)
-    if len(unique_idx) < len(d_sorted):
-        d_unique = d_sorted[unique_idx]
-        v_unique = np.empty(len(d_unique))
-        for j, idx in enumerate(unique_idx):
-            next_idx = unique_idx[j + 1] if j + 1 < len(unique_idx) else len(d_sorted)
-            v_unique[j] = np.nanmean(v_sorted[idx:next_idx])
-        d_sorted = d_unique
-        v_sorted = v_unique
-
-    if len(d_sorted) < 2:
-        result = np.full(len(depth_centers), np.nan)
-        if len(d_sorted) == 1:
-            idx = np.argmin(np.abs(depth_centers - d_sorted[0]))
-            result[idx] = v_sorted[0]
-        return result
-
-    f = interp1d(d_sorted, v_sorted, kind='linear',
-                 bounds_error=False, fill_value=np.nan)
-    return f(depth_centers)
+    return result
 
 
 def _make_l0_grid(l0_ds, depth_bin=None):
@@ -403,25 +396,36 @@ def plot_l0(l0_path, plot_path=None):
 
     _report_gaps(t_arr)
 
-    # Determine max plot depth using coverage-based approach:
-    # only show depths where at least 5% of profiles have data
+    # Determine max plot depth.
+    # Strategy: Use the 90th percentile of per-profile max depths,
+    # computed from the OPTICS sensors (chlorophyll, cdom) which have a
+    # natural depth limit. If optics aren't available, fall back to all vars.
+    # This matches the team's convention of showing the bio-relevant depth.
     n_profiles = len(t_arr)
     max_depth = 0.0
-    for var in VARS_TO_PLOT:
-        if var in grid_2d:
-            v = grid_2d[var]
-            # Count profiles with valid data at each depth bin
-            col_counts = np.sum(np.isfinite(v), axis=0).astype(float)
-            frac = col_counts / max(n_profiles, 1)
-            bins_ok = np.where(frac >= 0.05)[0]
-            if len(bins_ok) > 0:
-                max_depth = max(max_depth, float(depth_centers[bins_ok[-1]]))
+
+    # First try optics-based depth limit
+    optics_vars = [v for v in ["chlorophyll", "cdom"] if v in grid_2d]
+    depth_source_vars = optics_vars if optics_vars else \
+        [v for v in VARS_TO_PLOT if v in grid_2d]
+
+    all_max_depths = []
+    for var in depth_source_vars:
+        v = grid_2d[var]
+        for row in v:
+            finite_idx = np.where(np.isfinite(row))[0]
+            if len(finite_idx) > 0:
+                all_max_depths.append(float(depth_centers[finite_idx[-1]]))
+
+    if all_max_depths:
+        # 90th percentile of per-profile max depths
+        max_depth = float(np.percentile(all_max_depths, 90))
+        # Add padding
+        padding = max(10.0, max_depth * 0.10)
+        max_depth = max_depth + padding
+
     if max_depth < 10:
         max_depth = PLOT_DEPTH_MAX or 1000.0
-    else:
-        # Add padding (10% or 20m, whichever is larger)
-        padding = max(20.0, max_depth * 0.10)
-        max_depth = min(max_depth + padding, float(depth_centers.max()))
 
     print(f"  L0 plot depth: {max_depth:.0f} m")
 
