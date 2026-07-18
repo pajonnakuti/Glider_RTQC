@@ -47,6 +47,9 @@ parser.add_argument("--l0-path",    default=None,
                          "Skips Step 1 (binary decode) automatically.")
 parser.add_argument("--skip-step1", action="store_true",
                     help="Skip binary decode — use existing L0 timeseries")
+parser.add_argument("--reuse-l0", action="store_true",
+                    help="Reuse existing L0 file if found (skip re-decode). "
+                         "Without this flag, Step 1 always re-decodes.")
 parser.add_argument("--deploy-yml", default=None,
                     help="Path to deployment.yml (if not in data-dir)")
 _args, _ = parser.parse_known_args()
@@ -132,7 +135,19 @@ def main():
 
     # ── Resolve the explicit L0 path ──────────────────────────────
     _explicit_l0 = getattr(_args, "l0_path", None)
+    _reuse_l0    = _args.reuse_l0
     _skip1       = _args.skip_step1 or (_explicit_l0 is not None)
+
+    # --reuse-l0: skip step1 only if an existing L0 is found
+    if _reuse_l0 and not _skip1:
+        default = _l0_nc(dirs)
+        found_l0 = default if os.path.exists(default) else get_l0_path()
+        if found_l0 and os.path.exists(found_l0):
+            _skip1 = True
+            _explicit_l0 = found_l0
+            print(f"  --reuse-l0: found existing L0, skipping Step 1: {found_l0}")
+        else:
+            print(f"  --reuse-l0: no existing L0 found, will run Step 1")
 
     # Auto-skip if dbdreader not installed
     if not _skip1 and RUN_STEP1:
@@ -153,18 +168,18 @@ def main():
         _cfg.OUTPUT_DIR = OUTPUT_DIR       # restore
         print()
     else:
-        # Prefer explicit path, then auto-detect
+        # Step 1 was explicitly skipped — use provided or auto-detected L0
         if _explicit_l0 and os.path.exists(_explicit_l0):
             l0_path = _explicit_l0
             print(f"  Using specified L0: {l0_path}")
         else:
-            # Try the output L0-timeseries dir first, then auto-detect
+            # Only look for existing L0 if step1 was explicitly skipped
             default = _l0_nc(dirs)
             l0_path = default if os.path.exists(default) else get_l0_path()
             if l0_path and os.path.exists(l0_path):
                 print(f"  Using existing L0:  {l0_path}")
             else:
-                print(f"  Step 1 skipped. L0 not found.")
+                print(f"  Step 1 skipped but no L0 file found.")
                 l0_path = None
 
     if not l0_path or not os.path.exists(l0_path):

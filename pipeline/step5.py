@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import OUTPUT_DIR, GLIDER_ID, PLOT_DEPTH_MAX, DEPTH_BIN
+from config import OUTPUT_DIR, GLIDER_ID, PLOT_DEPTH_MAX, DEPTH_BIN, GRID_TIME_BIN_H
 
 # Gaps longer than this (hours) are masked in pcolormesh
 GAP_THRESHOLD_HOURS = 48
@@ -31,8 +31,15 @@ VARS_TO_PLOT = ["potential_temperature", "salinity",
                 "oxygen_concentration", "chlorophyll", "cdom"]
 CMAPS        = ["RdYlBu_r", "viridis", "viridis", "viridis", "RdBu_r"]
 
+# Fallback variable names: if primary name not in dataset, try these
+VAR_FALLBACKS = {
+    "potential_temperature": "temperature",
+    "salinity": None,  # no fallback
+}
+
 VAR_LABELS   = {
     "potential_temperature": "water potential temperature [Celsius]",
+    "temperature":           "water temperature [Celsius]",
     "salinity":              "water salinity [1e-3]",
     "oxygen_concentration":  "oxygen concentration [umol l-1]",
     "chlorophyll":           "chlorophyll [mg m-3]",
@@ -43,6 +50,16 @@ VAR_LABELS   = {
 # ----------------------------------------------------------------
 # Shared helpers
 # ----------------------------------------------------------------
+
+def _resolve_var(ds, var_name):
+    """Resolve a variable name, checking fallbacks if primary doesn't exist."""
+    if var_name in ds:
+        return var_name
+    fallback = VAR_FALLBACKS.get(var_name)
+    if fallback and fallback in ds:
+        return fallback
+    return None
+
 
 def _pcolormesh_edges(centers):
     """Compute cell edges from center values (handles datetime64)."""
@@ -205,19 +222,18 @@ def _finalise_fig(fig, axes, plot_path):
 # L0 plot  — raw data, no QC masking
 # ----------------------------------------------------------------
 
-def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
+def _make_l1_grid_from_ts(l1_ds, depth_bin=None, time_bin_h=None):
     """
-    Build a 2D grid from L1 timeseries, applying QC (flags 1 & 2 only).
+    Build a 2D grid from L1 timeseries using UNIFORM TIME BINS.
+    Each grid column covers a fixed time interval (default 3h), aggregating
+    all observations in that window regardless of profile boundaries.
+    This eliminates the picket-fence pattern from irregular profile spacing.
     Returns (grid_data dict, time_arr, depth_centers) or (None, None, None).
     """
     if depth_bin is None:
         depth_bin = DEPTH_BIN
-
-    if "profile_index" not in l1_ds:
-        return None, None, None
-
-    pi_vals = l1_ds["profile_index"].values
-    unique_profiles = np.unique(pi_vals[np.isfinite(pi_vals)])
+    if time_bin_h is None:
+        time_bin_h = GRID_TIME_BIN_H
 
     depth_raw = l1_ds["depth"].values if "depth" in l1_ds else None
     if depth_raw is None:
@@ -230,84 +246,79 @@ def _make_l1_grid_from_ts(l1_ds, depth_bin=None):
     if max_depth < 10:
         max_depth = PLOT_DEPTH_MAX or 1000.0
     depth_centers = np.arange(depth_bin / 2.0, max_depth + depth_bin / 2.0, depth_bin)
+    n_depth = len(depth_centers)
 
-    gridded = {var: [] for var in VARS_TO_PLOT}
-    times   = []
+    # Build uniform time axis
+    time_vals = l1_ds.time.values
+    t_float = time_vals.astype("datetime64[s]").astype(float)
+    finite_mask = np.isfinite(t_float)
+    if np.sum(finite_mask) == 0:
+        return None, None, None
+    t_start = time_vals[finite_mask][0]
+    t_end = time_vals[finite_mask][-1]
+    time_bin_td = np.timedelta64(int(time_bin_h * 3600), 's')
+    time_edges = np.arange(t_start, t_end + time_bin_td, time_bin_td)
+    time_centers = time_edges[:-1] + time_bin_td // 2
+    n_time = len(time_centers)
 
-    for p_num in unique_profiles:
-        mask   = (pi_vals == p_num)
-        d_vals = depth_raw[mask]
-        t_vals = l1_ds.time.values[mask].astype("datetime64[s]").astype(float)
-        times.append(float(np.nanmean(t_vals)) if len(t_vals) > 0 else np.nan)
+    if n_time == 0:
+        return None, None, None
 
-        for var in VARS_TO_PLOT:
-            if var in l1_ds:
-                v_vals = l1_ds[var].values[mask]
-                # Apply QC: only keep flags 1 & 2
-                qc_var = f"{var}_QC"
-                if qc_var in l1_ds:
-                    qc = l1_ds[qc_var].values[mask].astype(int)
-                    qc_ok = (qc == 1) | (qc == 2)
-                else:
-                    qc_ok = np.ones(len(v_vals), dtype=bool)
-                valid = np.isfinite(d_vals) & np.isfinite(v_vals) & qc_ok
-                if np.sum(valid) > 0:
-                    gridded[var].append(
-                        _interp_profile(d_vals[valid], v_vals[valid],
-                                        depth_centers))
-                else:
-                    gridded[var].append(np.full(len(depth_centers), np.nan))
-            else:
-                gridded[var].append(np.full(len(depth_centers), np.nan))
+    # Digitize time and depth for fast bin-aggregation
+    t_edge_float = time_edges.astype("datetime64[s]").astype(float)
+    t_bin_idx = np.clip(np.digitize(t_float, t_edge_float) - 1, 0, n_time - 1)
 
-    time_arr = np.array(times).astype("datetime64[s]")
-    grid_2d  = {}
+    d_edge = np.arange(0, max_depth + depth_bin, depth_bin)
+    d_bin_idx = np.clip(np.digitize(depth_raw, d_edge) - 1, 0, n_depth - 1)
+
+    grid_2d = {}
     for var in VARS_TO_PLOT:
-        if var in l1_ds and len(gridded[var]) > 0:
-            grid_2d[var] = np.vstack(gridded[var])
+        actual_var = _resolve_var(l1_ds, var)
+        if actual_var is None:
+            continue
+        v_arr = l1_ds[actual_var].values
 
-    return grid_2d, time_arr, depth_centers
+        # Apply QC mask
+        qc_var = f"{actual_var}_QC"
+        if qc_var not in l1_ds:
+            # Try the canonical name QC var too
+            qc_var = f"{var}_QC"
+        if qc_var in l1_ds:
+            qc = l1_ds[qc_var].values.astype(float)
+            qc_ok = (qc == 1) | (qc == 2)
+        else:
+            qc_ok = np.ones(len(v_arr), dtype=bool)
+
+        valid = np.isfinite(depth_raw) & np.isfinite(v_arr) & qc_ok
+        if np.sum(valid) == 0:
+            continue
+
+        # Aggregate into grid
+        sums = np.zeros((n_time, n_depth))
+        counts = np.zeros((n_time, n_depth))
+        vi = np.where(valid)[0]
+        np.add.at(sums, (t_bin_idx[vi], d_bin_idx[vi]), v_arr[vi])
+        np.add.at(counts, (t_bin_idx[vi], d_bin_idx[vi]), 1)
+        grid_2d[var] = np.where(counts > 0, sums / counts, np.nan)
+
+    return grid_2d, time_centers, depth_centers
 
 
-def _interp_profile(d_vals, v_vals, depth_centers):
+def _make_l0_grid(l0_ds, depth_bin=None, time_bin_h=None):
     """
-    Bin-average a single profile onto regular depth grid.
-    Only fills bins where actual measurements exist — NO interpolation
-    into unmeasured depths. This is critical for correct depth-limit detection.
-    """
-    depth_bin = depth_centers[1] - depth_centers[0] if len(depth_centers) > 1 else 1.0
-    result = np.full(len(depth_centers), np.nan)
-
-    for i, dc in enumerate(depth_centers):
-        # Find measurements within this depth bin
-        in_bin = (d_vals >= dc - depth_bin / 2.0) & (d_vals < dc + depth_bin / 2.0)
-        if np.any(in_bin):
-            result[i] = np.nanmean(v_vals[in_bin])
-
-    return result
-
-
-def _make_l0_grid(l0_ds, depth_bin=None):
-    """
-    Build a quick 2D grid from the L0 timeseries (all finite values, no QC).
-    Uses linear interpolation within each profile to fill the depth grid.
+    Build a 2D grid from L0 timeseries using UNIFORM TIME BINS.
+    All finite values included, no QC masking.
     Returns (grid_data dict, time_arr, depth_centers).
     """
     if depth_bin is None:
         depth_bin = DEPTH_BIN
-
-    if "profile_index" not in l0_ds:
-        return None, None, None
-
-    pi_vals = l0_ds["profile_index"].values
-    unique_profiles = np.unique(pi_vals[np.isfinite(pi_vals)])
+    if time_bin_h is None:
+        time_bin_h = GRID_TIME_BIN_H
 
     depth_raw = l0_ds["depth"].values if "depth" in l0_ds else None
     if depth_raw is None:
         return None, None, None
 
-    # Use 99th percentile of actual depth values to avoid pressure spikes
-    # stretching the grid unnecessarily
     finite_depths = depth_raw[np.isfinite(depth_raw)]
     if len(finite_depths) == 0:
         return None, None, None
@@ -315,36 +326,49 @@ def _make_l0_grid(l0_ds, depth_bin=None):
     if max_depth < 10:
         max_depth = PLOT_DEPTH_MAX or 1000.0
     depth_centers = np.arange(depth_bin / 2.0, max_depth + depth_bin / 2.0, depth_bin)
+    n_depth = len(depth_centers)
 
-    gridded = {var: [] for var in VARS_TO_PLOT}
-    times   = []
+    # Build uniform time axis
+    time_vals = l0_ds.time.values
+    t_float = time_vals.astype("datetime64[s]").astype(float)
+    finite_mask = np.isfinite(t_float)
+    if np.sum(finite_mask) == 0:
+        return None, None, None
+    t_start = time_vals[finite_mask][0]
+    t_end = time_vals[finite_mask][-1]
+    time_bin_td = np.timedelta64(int(time_bin_h * 3600), 's')
+    time_edges = np.arange(t_start, t_end + time_bin_td, time_bin_td)
+    time_centers = time_edges[:-1] + time_bin_td // 2
+    n_time = len(time_centers)
 
-    for p_num in unique_profiles:
-        mask   = (pi_vals == p_num)
-        d_vals = depth_raw[mask]
-        t_vals = l0_ds.time.values[mask].astype("datetime64[s]").astype(float)
-        times.append(float(np.nanmean(t_vals)) if len(t_vals) > 0 else np.nan)
+    if n_time == 0:
+        return None, None, None
 
-        for var in VARS_TO_PLOT:
-            if var in l0_ds:
-                v_vals = l0_ds[var].values[mask]
-                valid  = np.isfinite(d_vals) & np.isfinite(v_vals)
-                if np.sum(valid) > 0:
-                    gridded[var].append(
-                        _interp_profile(d_vals[valid], v_vals[valid],
-                                        depth_centers))
-                else:
-                    gridded[var].append(np.full(len(depth_centers), np.nan))
-            else:
-                gridded[var].append(np.full(len(depth_centers), np.nan))
+    # Digitize time and depth
+    t_edge_float = time_edges.astype("datetime64[s]").astype(float)
+    t_bin_idx = np.clip(np.digitize(t_float, t_edge_float) - 1, 0, n_time - 1)
 
-    time_arr = np.array(times).astype("datetime64[s]")
-    grid_2d  = {}
+    d_edge = np.arange(0, max_depth + depth_bin, depth_bin)
+    d_bin_idx = np.clip(np.digitize(depth_raw, d_edge) - 1, 0, n_depth - 1)
+
+    grid_2d = {}
     for var in VARS_TO_PLOT:
-        if var in l0_ds and len(gridded[var]) > 0:
-            grid_2d[var] = np.vstack(gridded[var])
+        actual_var = _resolve_var(l0_ds, var)
+        if actual_var is None:
+            continue
+        v_arr = l0_ds[actual_var].values
+        valid = np.isfinite(depth_raw) & np.isfinite(v_arr)
+        if np.sum(valid) == 0:
+            continue
 
-    return grid_2d, time_arr, depth_centers
+        sums = np.zeros((n_time, n_depth))
+        counts = np.zeros((n_time, n_depth))
+        vi = np.where(valid)[0]
+        np.add.at(sums, (t_bin_idx[vi], d_bin_idx[vi]), v_arr[vi])
+        np.add.at(counts, (t_bin_idx[vi], d_bin_idx[vi]), 1)
+        grid_2d[var] = np.where(counts > 0, sums / counts, np.nan)
+
+    return grid_2d, time_centers, depth_centers
 
 
 def plot_l0(l0_path, plot_path=None):
@@ -446,12 +470,29 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
     ds = None
     is_1d = False
 
-    if grid_path and os.path.exists(grid_path):
+    # Prefer building uniform-time-bin grid from L1 timeseries for plotting.
+    # This eliminates picket-fence artifacts from irregular profile spacing.
+    if l1_path is not None and os.path.exists(l1_path):
+        print(f"  Building L1 plot grid from timeseries (uniform time bins)...")
+        l1_ds = xr.open_dataset(l1_path)
+        if "depth" in l1_ds:
+            grid_2d, t_arr, depth_centers = _make_l1_grid_from_ts(l1_ds)
+            if grid_2d is not None:
+                l1_ds.close()
+                ds = xr.Dataset(coords={"time": t_arr, "depth": depth_centers})
+                for var in VARS_TO_PLOT:
+                    if var in grid_2d:
+                        ds[var] = xr.DataArray(grid_2d[var],
+                                               dims=["time", "depth"])
+                is_1d = False
+            else:
+                l1_ds.close()
+
+    # Fallback: use pre-built grid file if timeseries approach failed
+    if ds is None and grid_path and os.path.exists(grid_path):
         print(f"  Loading grid: {grid_path}")
         ds = xr.open_dataset(grid_path)
-        # Verify it actually has 2D structure
         if "depth" in ds and "time" in ds:
-            # Check that at least one science variable is 2D
             has_2d = False
             for var in VARS_TO_PLOT:
                 if var in ds and ds[var].ndim == 2:
@@ -466,13 +507,12 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
     if ds is None and l1_path is not None and os.path.exists(l1_path):
         print(f"  Loading L1 timeseries (grid not usable): {l1_path}")
         ds = xr.open_dataset(l1_path)
-        # If it has profile_index and depth, build a grid on-the-fly
-        if "profile_index" in ds and "depth" in ds:
-            print(f"  Building L1 grid on-the-fly from timeseries...")
+        # Build uniform-time-bin grid on-the-fly from timeseries
+        if "depth" in ds:
+            print(f"  Building L1 grid on-the-fly (uniform time bins)...")
             grid_2d, t_arr, depth_centers = _make_l1_grid_from_ts(ds)
             if grid_2d is not None:
                 ds.close()
-                # Create a temporary xarray dataset from the grid
                 gds = xr.Dataset(coords={"time": t_arr, "depth": depth_centers})
                 for var in VARS_TO_PLOT:
                     if var in grid_2d:

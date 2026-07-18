@@ -95,30 +95,40 @@ def plot_track(l1_path, l0_path=None, plot_path=None):
 
     fig = plt.figure(figsize=(12, 8))
 
-    if HAS_CARTOPY:
-        ax = fig.add_subplot(1, 1, 1,
-                             projection=ccrs.PlateCarree())
-        ax.set_extent(extent, crs=ccrs.PlateCarree())
-        ax.add_feature(cfeature.LAND,       facecolor="lightgray",  zorder=1)
-        ax.add_feature(cfeature.OCEAN,      facecolor="lightblue",  zorder=0)
-        ax.add_feature(cfeature.COASTLINE,  linewidth=0.8,          zorder=2)
-        ax.add_feature(cfeature.BORDERS,    linewidth=0.4,
-                       linestyle=":",       zorder=2)
-        ax.add_feature(cfeature.RIVERS,     linewidth=0.3,
-                       edgecolor="blue",    zorder=2)
-        gl = ax.gridlines(draw_labels=True, linewidth=0.5,
-                          color="gray", alpha=0.5)
-        gl.top_labels   = False
-        gl.right_labels = False
-        sc = ax.scatter(lon_v, lat_v, c=t_norm, cmap="plasma",
-                        s=6, transform=ccrs.PlateCarree(),
-                        zorder=3, alpha=0.8)
-        # Mark start and end
-        ax.plot(lon_v[0],  lat_v[0],  "g^", ms=10,
-                transform=ccrs.PlateCarree(), zorder=5, label="Start")
-        ax.plot(lon_v[-1], lat_v[-1], "rs", ms=10,
-                transform=ccrs.PlateCarree(), zorder=5, label="End")
-    else:
+    _use_cartopy = HAS_CARTOPY
+    if _use_cartopy:
+        try:
+            ax = fig.add_subplot(1, 1, 1,
+                                 projection=ccrs.PlateCarree())
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+            ax.add_feature(cfeature.LAND,       facecolor="lightgray",  zorder=1)
+            ax.add_feature(cfeature.OCEAN,      facecolor="lightblue",  zorder=0)
+            ax.add_feature(cfeature.COASTLINE,  linewidth=0.8,          zorder=2)
+            ax.add_feature(cfeature.BORDERS,    linewidth=0.4,
+                           linestyle=":",       zorder=2)
+            ax.add_feature(cfeature.RIVERS,     linewidth=0.3,
+                           edgecolor="blue",    zorder=2)
+            gl = ax.gridlines(draw_labels=True, linewidth=0.5,
+                              color="gray", alpha=0.5)
+            gl.top_labels   = False
+            gl.right_labels = False
+            sc = ax.scatter(lon_v, lat_v, c=t_norm, cmap="plasma",
+                            s=6, transform=ccrs.PlateCarree(),
+                            zorder=3, alpha=0.8)
+            # Mark start and end
+            ax.plot(lon_v[0],  lat_v[0],  "g^", ms=10,
+                    transform=ccrs.PlateCarree(), zorder=5, label="Start")
+            ax.plot(lon_v[-1], lat_v[-1], "rs", ms=10,
+                    transform=ccrs.PlateCarree(), zorder=5, label="End")
+        except Exception as e:
+            # Cartopy failed (e.g. shapefile download blocked, HTTP 403)
+            print(f"  WARNING: cartopy basemap unavailable ({e}), "
+                  f"falling back to plain scatter")
+            plt.close(fig)
+            fig = plt.figure(figsize=(12, 8))
+            _use_cartopy = False
+
+    if not _use_cartopy:
         ax = fig.add_subplot(1, 1, 1)
         ax.set_xlim(extent[0], extent[1])
         ax.set_ylim(extent[2], extent[3])
@@ -159,8 +169,37 @@ def plot_track(l1_path, l0_path=None, plot_path=None):
     ax.legend(loc="upper right", fontsize=10)
 
     plt.tight_layout()
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-    print(f"  Track map saved: {plot_path}")
+    try:
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        print(f"  Track map saved: {plot_path}")
+    except Exception as e:
+        # Cartopy render failure (shapefile download at render time)
+        if _use_cartopy:
+            print(f"  WARNING: cartopy render failed ({e}), "
+                  f"retrying without basemap")
+            plt.close(fig)
+            # Redo as plain scatter
+            fig = plt.figure(figsize=(12, 8))
+            ax = fig.add_subplot(1, 1, 1)
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.set_facecolor("lightblue")
+            ax.set_xlabel("Longitude (°E)", fontsize=12)
+            ax.set_ylabel("Latitude (°N)", fontsize=12)
+            ax.grid(True, linestyle="--", alpha=0.5)
+            sc = ax.scatter(lon_v, lat_v, c=t_norm, cmap="plasma",
+                            s=6, alpha=0.8)
+            ax.plot(lon_v[0],  lat_v[0],  "g^", ms=10, label="Start")
+            ax.plot(lon_v[-1], lat_v[-1], "rs", ms=10, label="End")
+            cbar = plt.colorbar(sc, ax=ax, pad=0.02, fraction=0.03)
+            cbar.set_label("Time", fontsize=11)
+            ax.set_title(title, fontsize=12, fontweight="bold")
+            ax.legend(loc="upper right", fontsize=10)
+            plt.tight_layout()
+            plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+            print(f"  Track map saved (plain fallback): {plot_path}")
+        else:
+            print(f"  ERROR: track map save failed: {e}")
     plt.close(fig)
     ds.close()
     return plot_path

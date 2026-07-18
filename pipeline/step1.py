@@ -51,7 +51,9 @@ def get_all_params(mdb):
 
 
 def load_config(yaml_path):
-    if not os.path.exists(yaml_path) or not HAS_YAML:
+    if not os.path.exists(yaml_path):
+        print(f"  WARNING: deployment.yml not found at {yaml_path} "
+              f"— using default metadata")
         return {
             "metadata": {
                 "deployment_name": f"glider_{GLIDER_ID}",
@@ -65,9 +67,42 @@ def load_config(yaml_path):
             },
             "netcdf_variables": {},
         }
-    with open(yaml_path) as f:
-        config = yaml.safe_load(f)
-    return config
+    if not HAS_YAML:
+        print(f"  WARNING: PyYAML not installed — cannot read deployment.yml, "
+              f"using default metadata")
+        return {
+            "metadata": {
+                "deployment_name": f"glider_{GLIDER_ID}",
+                "glider_serial": GLIDER_ID,
+                "glider_model": "Slocum",
+                "institution": "INCOIS",
+                "source": "Glider observations",
+                "comment": "",
+                "sea_name": "",
+                "platform_type": "Slocum Glider",
+            },
+            "netcdf_variables": {},
+        }
+    try:
+        with open(yaml_path) as f:
+            config = yaml.safe_load(f)
+        return config
+    except Exception as e:
+        print(f"  WARNING: deployment.yml unreadable ({e}) "
+              f"— using default metadata")
+        return {
+            "metadata": {
+                "deployment_name": f"glider_{GLIDER_ID}",
+                "glider_serial": GLIDER_ID,
+                "glider_model": "Slocum",
+                "institution": "INCOIS",
+                "source": "Glider observations",
+                "comment": "",
+                "sea_name": "",
+                "platform_type": "Slocum Glider",
+            },
+            "netcdf_variables": {},
+        }
 
 
 def _sanitize_cache_dir(cache_dir):
@@ -365,18 +400,35 @@ def filter_science(science):
 
 
 def sync_data(flight, science):
-    print("  Syncing all data onto science time axis...")
-    if "sci_water_temp" not in science:
-        raise ValueError("No sci_water_temp - cannot establish time axis")
+    """
+    Sync all variables onto a common time axis.
 
-    master_t = science["sci_water_temp"][0]
-    order = np.argsort(master_t)
-    master_t = master_t[order]
-    unique_mask = np.concatenate([[True], np.diff(master_t) > 0])
+    The master time axis is the UNION of all sensor timestamps (science +
+    flight), not just sci_water_temp. This ensures GPS fixes acquired at the
+    surface (when CTD is off) are preserved in the output.
+    """
+    print("  Syncing all data onto unified time axis...")
+
+    # Build master time from ALL available timestamps
+    all_times = []
+    for var, (t, v) in science.items():
+        if len(t) > 0:
+            all_times.append(t)
+    for var, (t, v) in flight.items():
+        if len(t) > 0:
+            all_times.append(t)
+
+    if not all_times:
+        raise ValueError("No sensor data available to build time axis")
+
+    master_t = np.unique(np.concatenate(all_times))
+    master_t = np.sort(master_t)
+    # Remove duplicates (timestamps within 0.01s of each other)
+    unique_mask = np.concatenate([[True], np.diff(master_t) > 0.01])
     master_t = master_t[unique_mask]
     n = len(master_t)
 
-    print(f"  Master time: {n:,} points")
+    print(f"  Master time: {n:,} points (union of all sensors)")
     print(f"  Duration: {(master_t[-1] - master_t[0]) / 86400:.1f} days")
 
     synced = {"time": master_t}
@@ -529,6 +581,29 @@ def write_netcdf(synced, config, output_path):
                 if k not in ("source", "coordinates", "conversion"):
                     attrs[k] = v
         ds[nc_name] = xr.DataArray(synced[internal].astype(np.float64), dims=["time"], attrs=attrs)
+
+    # Check optics calibration: Slocum's sci_flbbcd_*_units should already be
+    # in physical units (mg/m³, ppb, m⁻¹) from firmware calibration. But if
+    # values look like raw counts (chlorophyll max > 50 mg/m³), flag them.
+    _optics_cal_warning = False
+    for nc_name, max_plausible in [("chlorophyll", 50.0),
+                                    ("cdom", 200.0),
+                                    ("backscatter_700", 0.05),
+                                    ("oxygen_concentration", 500.0)]:
+        if nc_name in ds:
+            vmax = float(np.nanmax(ds[nc_name].values))
+            if vmax > max_plausible:
+                _optics_cal_warning = True
+                ds[nc_name].attrs["comment"] = (
+                    f"WARNING: max value ({vmax:.1f}) exceeds plausible "
+                    f"physical range. Values may be uncalibrated raw counts "
+                    f"or corrupted. Verify sensor calibration coefficients.")
+                print(f"  WARNING: {nc_name} max={vmax:.1f} exceeds "
+                      f"plausible range ({max_plausible}) — may be uncalibrated")
+            else:
+                ds[nc_name].attrs["comment"] = (
+                    "Firmware-calibrated values from glider sensor. "
+                    "No additional post-processing calibration applied.")
 
     if "latitude" in ds and "longitude" in ds:
         lat = ds["latitude"].values

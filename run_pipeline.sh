@@ -84,28 +84,6 @@ if [ -n "$2" ]; then
     # Explicit L0 path provided — skip step 1
     L0_ARG="--l0-path $2"
     SKIP_ARG="--skip-step1"
-else
-    # Auto-detect: if DATA_DIR has an L0-timeseries folder, use it and skip step 1
-    DATA_DIR="${1:-}"
-    if [ -z "$DATA_DIR" ]; then
-        # Get DATA_DIR from config.py
-        DATA_DIR=$("$PYTHON" -c "
-import sys; sys.path.insert(0, '$PIPELINE_DIR')
-import config; print(config.DATA_DIR)
-" 2>/dev/null)
-    fi
-
-    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR/L0-timeseries" ]; then
-        # Find the largest NC file in L0-timeseries
-        L0_FILE=$(ls -S "$DATA_DIR/L0-timeseries/"*.nc 2>/dev/null | head -1)
-        if [ -n "$L0_FILE" ] && [ -f "$L0_FILE" ]; then
-            echo "Auto-detected L0: $L0_FILE"
-            echo "Skipping Step 1 (binary decode) — using existing L0 timeseries"
-            echo ""
-            L0_ARG="--l0-path $L0_FILE"
-            SKIP_ARG="--skip-step1"
-        fi
-    fi
 fi
 
 # --- Run ---
