@@ -22,7 +22,13 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import OUTPUT_DIR, GLIDER_ID, PLOT_DEPTH_MAX, DEPTH_BIN, GRID_TIME_BIN_H
+from config import OUTPUT_DIR, GLIDER_ID, PLOT_DEPTH_MAX, DEPTH_BIN
+
+# Time bin width for gridplots (hours). Imported separately with fallback.
+try:
+    from config import GRID_TIME_BIN_H
+except ImportError:
+    GRID_TIME_BIN_H = 3.0
 
 # Gaps longer than this (hours) are masked in pcolormesh
 GAP_THRESHOLD_HOURS = 48
@@ -35,6 +41,9 @@ CMAPS        = ["RdYlBu_r", "viridis", "viridis", "viridis", "RdBu_r"]
 VAR_FALLBACKS = {
     "potential_temperature": "temperature",
     "salinity": None,  # no fallback
+    "oxygen_concentration": "sci_oxy4_oxygen",
+    "chlorophyll": "sci_flbbcd_chlor_units",
+    "cdom": "sci_flbbcd_cdom_units",
 }
 
 VAR_LABELS   = {
@@ -64,6 +73,12 @@ def _resolve_var(ds, var_name):
 def _pcolormesh_edges(centers):
     """Compute cell edges from center values (handles datetime64)."""
     c = np.asarray(centers)
+    if len(c) < 2:
+        # Can't compute edges from a single point — create a tiny range
+        if np.issubdtype(c.dtype, np.datetime64):
+            c_num = mdates.date2num(c)
+            return np.array([c_num[0] - 0.5, c_num[0] + 0.5])
+        return np.array([c[0] - 0.5, c[0] + 0.5])
     if np.issubdtype(c.dtype, np.datetime64):
         c_num = mdates.date2num(c)
         edges = np.empty(len(c) + 1)
@@ -149,6 +164,13 @@ def _draw_pcolormesh(ax, t_vals, depth_vals, V, cmap, label, max_depth):
     # Guard: V must be exactly 2D (n_time × n_depth)
     if V.ndim != 2 or V.shape != (len(t_vals), len(depth_vals)):
         ax.set_title(f"{label} (not 2D)", fontsize=13)
+        ax.set_ylim(max_depth, 0)
+        ax.set_ylabel("Depth (m)", fontsize=11)
+        return False
+
+    # Guard: need at least 2 time points for pcolormesh
+    if len(t_vals) < 2:
+        ax.set_title(f"{label} (insufficient time points: {len(t_vals)})", fontsize=13)
         ax.set_ylim(max_depth, 0)
         ax.set_ylabel("Depth (m)", fontsize=11)
         return False
@@ -256,7 +278,14 @@ def _make_l1_grid_from_ts(l1_ds, depth_bin=None, time_bin_h=None):
         return None, None, None
     t_start = time_vals[finite_mask][0]
     t_end = time_vals[finite_mask][-1]
-    time_bin_td = np.timedelta64(int(time_bin_h * 3600), 's')
+
+    # Adaptive time bin: ensure at least 5 time columns
+    duration_s = (t_end - t_start) / np.timedelta64(1, 's')
+    min_bins = 5
+    max_bin_s = max(duration_s / min_bins, 60)  # at least 60s per bin
+    bin_s = min(time_bin_h * 3600, max_bin_s)
+    time_bin_td = np.timedelta64(int(bin_s), 's')
+
     time_edges = np.arange(t_start, t_end + time_bin_td, time_bin_td)
     time_centers = time_edges[:-1] + time_bin_td // 2
     n_time = len(time_centers)
@@ -316,7 +345,11 @@ def _make_l0_grid(l0_ds, depth_bin=None, time_bin_h=None):
         time_bin_h = GRID_TIME_BIN_H
 
     depth_raw = l0_ds["depth"].values if "depth" in l0_ds else None
+    if depth_raw is None and "pressure" in l0_ds:
+        # Fallback: approximate depth from pressure (1 dbar ≈ 1 m)
+        depth_raw = l0_ds["pressure"].values
     if depth_raw is None:
+        print("  WARNING: no 'depth' or 'pressure' variable in L0")
         return None, None, None
 
     finite_depths = depth_raw[np.isfinite(depth_raw)]
@@ -336,7 +369,14 @@ def _make_l0_grid(l0_ds, depth_bin=None, time_bin_h=None):
         return None, None, None
     t_start = time_vals[finite_mask][0]
     t_end = time_vals[finite_mask][-1]
-    time_bin_td = np.timedelta64(int(time_bin_h * 3600), 's')
+
+    # Adaptive time bin: ensure at least 5 time columns
+    duration_s = (t_end - t_start) / np.timedelta64(1, 's')
+    min_bins = 5
+    max_bin_s = max(duration_s / min_bins, 60)  # at least 60s per bin
+    bin_s = min(time_bin_h * 3600, max_bin_s)
+    time_bin_td = np.timedelta64(int(bin_s), 's')
+
     time_edges = np.arange(t_start, t_end + time_bin_td, time_bin_td)
     time_centers = time_edges[:-1] + time_bin_td // 2
     n_time = len(time_centers)
@@ -355,10 +395,12 @@ def _make_l0_grid(l0_ds, depth_bin=None, time_bin_h=None):
     for var in VARS_TO_PLOT:
         actual_var = _resolve_var(l0_ds, var)
         if actual_var is None:
+            print(f"    {var}: NOT FOUND in L0 dataset")
             continue
         v_arr = l0_ds[actual_var].values
         valid = np.isfinite(depth_raw) & np.isfinite(v_arr)
         if np.sum(valid) == 0:
+            print(f"    {var} ({actual_var}): 0 valid points (depth or value all NaN)")
             continue
 
         sums = np.zeros((n_time, n_depth))
@@ -367,23 +409,93 @@ def _make_l0_grid(l0_ds, depth_bin=None, time_bin_h=None):
         np.add.at(sums, (t_bin_idx[vi], d_bin_idx[vi]), v_arr[vi])
         np.add.at(counts, (t_bin_idx[vi], d_bin_idx[vi]), 1)
         grid_2d[var] = np.where(counts > 0, sums / counts, np.nan)
+        n_filled = int(np.sum(counts > 0))
+        print(f"    {var} ({actual_var}): {n_filled}/{n_time*n_depth} grid cells filled")
 
     return grid_2d, time_centers, depth_centers
 
 
-def plot_l0(l0_path, plot_path=None):
-    """Generate the L0 raw gridplot."""
+def plot_l0(l0_path, plot_path=None, l0_grid_path=None):
+    """Generate the L0 raw gridplot. Uses pre-built L0 grid if available."""
     print("  Generating L0 plot (raw, no QC)...")
-
-    if not os.path.exists(l0_path):
-        print(f"  WARNING: L0 file not found: {l0_path}")
-        return None
 
     if plot_path is None:
         plots_dir = os.path.join(OUTPUT_DIR, "plots")
         os.makedirs(plots_dir, exist_ok=True)
         plot_path = os.path.join(plots_dir,
                                  f"incois_glider_{GLIDER_ID}_L0_gridplot.png")
+
+    # Try to use pre-built L0 grid (from step4/step1c) — much more reliable
+    if l0_grid_path is None:
+        candidates = [
+            os.path.join(OUTPUT_DIR, "L0-gridfiles",
+                         f"incois_glider_{GLIDER_ID}_L0_grid.nc"),
+            os.path.join(OUTPUT_DIR, "gridfiles",
+                         f"incois_glider_{GLIDER_ID}_L0_grid.nc"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                l0_grid_path = c
+                break
+
+    if l0_grid_path and os.path.exists(l0_grid_path):
+        print(f"  Using pre-built L0 grid: {l0_grid_path}")
+        ds = xr.open_dataset(l0_grid_path)
+        t_arr = ds.time.values
+        depth_centers = ds.depth.values
+
+        _report_gaps(t_arr)
+
+        # Determine max plot depth
+        n_time = len(t_arr)
+        max_depth = 0.0
+        grid_2d = {}
+        for var in VARS_TO_PLOT:
+            actual_var = _resolve_var(ds, var)
+            if actual_var is None:
+                continue
+            V = ds[actual_var].values
+            if V.ndim == 2 and V.shape == (n_time, len(depth_centers)):
+                grid_2d[var] = V
+                col_counts = np.sum(np.isfinite(V), axis=0).astype(float)
+                frac = col_counts / max(n_time, 1)
+                bins_ok = np.where(frac >= 0.10)[0]
+                if len(bins_ok) > 0:
+                    max_depth = max(max_depth, float(depth_centers[bins_ok[-1]]))
+
+        if max_depth < 10:
+            max_depth = float(depth_centers.max()) if len(depth_centers) > 0 else 1000.0
+
+        print(f"  L0 plot depth: {max_depth:.0f} m")
+
+        if len(t_arr) < 2:
+            print("  WARNING: L0 grid has fewer than 2 time points — skipping plot")
+            ds.close()
+            return None
+
+        fig, axes = plt.subplots(len(VARS_TO_PLOT), 1,
+                                 figsize=(14, 4 * len(VARS_TO_PLOT)), sharex=True)
+        fig.suptitle(f"Glider {GLIDER_ID}  —  L0 Raw Data (no QC)",
+                     fontsize=14, fontweight="bold", y=1.01)
+
+        for i, (var, cmap) in enumerate(zip(VARS_TO_PLOT, CMAPS)):
+            ax = axes[i]
+            if var not in grid_2d:
+                ax.set_title(f"{var} (NOT IN L0)", fontsize=13)
+                ax.set_ylim(max_depth, 0)
+                ax.set_ylabel("Depth (m)", fontsize=11)
+                continue
+            _draw_pcolormesh(ax, t_arr, depth_centers, grid_2d[var],
+                             cmap, var, max_depth)
+
+        _finalise_fig(fig, axes, plot_path)
+        ds.close()
+        return plot_path
+
+    # Fallback: build grid from L0 timeseries
+    if not os.path.exists(l0_path):
+        print(f"  WARNING: L0 file not found: {l0_path}")
+        return None
 
     ds = xr.open_dataset(l0_path)
 
@@ -470,9 +582,22 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
     ds = None
     is_1d = False
 
-    # Prefer building uniform-time-bin grid from L1 timeseries for plotting.
-    # This eliminates picket-fence artifacts from irregular profile spacing.
-    if l1_path is not None and os.path.exists(l1_path):
+    # Prefer the pre-built grid file (step4 output) — it has proper time coords
+    # and works reliably (step7 uses it successfully).
+    if grid_path and os.path.exists(grid_path):
+        print(f"  Loading L1 grid: {grid_path}")
+        ds = xr.open_dataset(grid_path)
+        # Verify it has 2D variables
+        has_2d = any(_resolve_var(ds, v) is not None and
+                     ds[_resolve_var(ds, v)].ndim == 2
+                     for v in VARS_TO_PLOT if _resolve_var(ds, v) is not None)
+        if not has_2d:
+            print(f"  WARNING: grid has no 2D plot variables — trying timeseries")
+            ds.close()
+            ds = None
+
+    # Fallback: build from L1 timeseries with uniform time bins
+    if ds is None and l1_path is not None and os.path.exists(l1_path):
         print(f"  Building L1 plot grid from timeseries (uniform time bins)...")
         l1_ds = xr.open_dataset(l1_path)
         if "depth" in l1_ds:
@@ -488,9 +613,9 @@ def plot_l1(grid_path, plot_path=None, l1_path=None):
             else:
                 l1_ds.close()
 
-    # Fallback: use pre-built grid file if timeseries approach failed
+    # Last fallback: use grid file even if variable check failed earlier
     if ds is None and grid_path and os.path.exists(grid_path):
-        print(f"  Loading grid: {grid_path}")
+        print(f"  Loading grid (last resort): {grid_path}")
         ds = xr.open_dataset(grid_path)
         if "depth" in ds and "time" in ds:
             has_2d = False

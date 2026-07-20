@@ -356,17 +356,28 @@ def filter_gps(flight):
         t, v = flight[var]
         n_before = len(v)
         good = np.ones(len(v), dtype=bool)
+        # Basic sanity: reject null-island and physically impossible values
         good &= np.abs(v) > 0.01
         good &= np.abs(v) < (90 if "lat" in var else 180)
 
-        if var == "m_lat":
-            good &= (v >= GPS_LAT_MIN) & (v <= GPS_LAT_MAX)
-        elif var == "m_lon":
-            good &= (v >= GPS_LON_MIN) & (v <= GPS_LON_MAX)
-        elif var == "c_wpt_lat":
-            good &= (v >= GPS_LAT_MIN - 5) & (v <= GPS_LAT_MAX + 5)
-        elif var == "c_wpt_lon":
-            good &= (v >= GPS_LON_MIN - 5) & (v <= GPS_LON_MAX + 5)
+        # GPS bounding box: ONLY apply if bounds were actually detected
+        # (not global defaults) AND we had enough fixes to trust the box.
+        # With < 50 fixes from .mlg headers, the box is unreliable for
+        # long deployments — skip it and let the hemisphere filter handle
+        # gross errors later.
+        bounds_are_global = (GPS_LAT_MIN <= -89 and GPS_LAT_MAX >= 89)
+        if not bounds_are_global:
+            # Use a very generous approach: only reject points that are
+            # clearly outside the deployment region (>10° beyond detected box)
+            margin = 10.0  # degrees — generous enough for any real transit
+            if var == "m_lat":
+                good &= (v >= GPS_LAT_MIN - margin) & (v <= GPS_LAT_MAX + margin)
+            elif var == "m_lon":
+                good &= (v >= GPS_LON_MIN - margin) & (v <= GPS_LON_MAX + margin)
+            elif var == "c_wpt_lat":
+                good &= (v >= GPS_LAT_MIN - margin) & (v <= GPS_LAT_MAX + margin)
+            elif var == "c_wpt_lon":
+                good &= (v >= GPS_LON_MIN - margin) & (v <= GPS_LON_MAX + margin)
 
         flight[var] = (t[good], v[good])
         n_removed = n_before - len(v[good])
@@ -426,6 +437,42 @@ def sync_data(flight, science):
     # Remove duplicates (timestamps within 0.01s of each other)
     unique_mask = np.concatenate([[True], np.diff(master_t) > 0.01])
     master_t = master_t[unique_mask]
+
+    # Remove obviously invalid timestamps (before year 2000 or after 2035)
+    t_min_valid = 946684800.0    # 2000-01-01 UTC
+    t_max_valid = 2051222400.0   # 2035-01-01 UTC
+    time_valid = (master_t >= t_min_valid) & (master_t <= t_max_valid)
+
+    # If deployment window is known, use it (with ±7 day margin) for tighter filtering
+    # This prevents cross-deployment contamination from binary files.
+    # NOTE: must import the module (not the variable) to get the runtime-updated value.
+    try:
+        import config as _cfg
+        deploy_start = getattr(_cfg, 'DEPLOY_TIME_START', None)
+        deploy_end = getattr(_cfg, 'DEPLOY_TIME_END', None)
+        margin_s = 7 * 86400  # 7 days margin
+        applied_window = False
+        if deploy_start is not None:
+            dt_start = np.datetime64(deploy_start).astype("datetime64[s]").astype(float)
+            time_valid &= (master_t >= dt_start - margin_s)
+            applied_window = True
+        if deploy_end is not None:
+            dt_end = np.datetime64(deploy_end).astype("datetime64[s]").astype(float)
+            time_valid &= (master_t <= dt_end + margin_s)
+            applied_window = True
+        if applied_window:
+            print(f"  Using deployment-window filter: {deploy_start} to {deploy_end} (±7d)")
+        else:
+            print(f"  No deployment window set — using broad 2000-2035 filter only")
+    except Exception as e:
+        print(f"  WARNING: deployment-window filter failed ({type(e).__name__}: {e}) "
+              f"— using broad 2000-2035 filter only")
+
+    n_bad_t = int(np.sum(~time_valid))
+    if n_bad_t > 0:
+        print(f"  WARNING: filtered {n_bad_t} timestamps outside deployment window")
+        master_t = master_t[time_valid]
+
     n = len(master_t)
 
     print(f"  Master time: {n:,} points (union of all sensors)")
@@ -545,7 +592,24 @@ def write_netcdf(synced, config, output_path):
     meta = config.get("metadata", {})
     ncvar = config.get("netcdf_variables", {})
 
-    time_dt = np.array([np.datetime64(int(t * 1e9), "ns") for t in synced["time"]])
+    # Filter out invalid timestamps before conversion.
+    # Valid Slocum timestamps are between 2000 and 2030 (epoch seconds).
+    t_raw = synced["time"]
+    t_min = 946684800.0    # 2000-01-01 UTC
+    t_max = 1893456000.0   # 2030-01-01 UTC
+    valid_time = (t_raw >= t_min) & (t_raw <= t_max) & np.isfinite(t_raw)
+
+    if not np.all(valid_time):
+        n_bad = int(np.sum(~valid_time))
+        print(f"  WARNING: removing {n_bad} invalid timestamps "
+              f"(out of {len(t_raw)} total)")
+        # Filter all arrays in synced to keep only valid timestamps
+        for key in synced:
+            if isinstance(synced[key], np.ndarray) and len(synced[key]) == len(t_raw):
+                synced[key] = synced[key][valid_time]
+        t_raw = synced["time"]
+
+    time_dt = np.array([np.datetime64(int(t * 1e9), "ns") for t in t_raw])
     ds = xr.Dataset(coords={"time": time_dt})
 
     vmap = [

@@ -24,7 +24,8 @@ import numpy as np
 
 # ============================================================
 # DATA_DIR — set your glider data folder here
-DATA_DIR = r"T:\glider_data\890_2"
+DATA_DIR = r"T:\glider_data\1126"
+
 # Linux:    DATA_DIR = "/data/glider/890_2"
 #
 # BETTER: pass it at runtime and never edit this file:
@@ -37,7 +38,7 @@ DATA_DIR = r"T:\glider_data\890_2"
 DATA_DIR = os.environ.get(
     "GLIDER_DATA_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 "..", "..", "Raw_Data", "1130-Mar-2025")
+                 "..", "..")
 )
 
 # ============================================================

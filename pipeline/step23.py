@@ -1044,7 +1044,8 @@ def pressure_cascade(ds, qc_dict):
     pres_bad = (qc_dict["pressure"] == 4) | (qc_dict["pressure"] == 9)
     n_casc = 0
     # Only cascade to physical variables that depend on pressure for context
-    cascade_vars = ["temperature", "salinity", "oxygen_concentration", "density"]
+    cascade_vars = ["temperature", "salinity", "oxygen_concentration", "density",
+                    "chlorophyll", "cdom", "backscatter_700"]
     for var in cascade_vars:
         if var not in qc_dict:
             continue
@@ -1100,7 +1101,7 @@ def apply_argo_qc(ds, config_pressure_dbar=1000.0):
         print(f"   Test 19 (Deepest pressure):    flagged {n19}")
     nc = pressure_cascade(ds, qc_dict)
     if nc > 0:
-        print(f"   Cascade (PRES_QC=4 -> T/S/O2): flagged {nc}")
+        print(f"   Cascade (PRES_QC=4 -> T/S/O2/optics): flagged {nc}")
 
     if "temperature" in qc_dict and "salinity" in qc_dict:
         t_qc = qc_dict["temperature"]

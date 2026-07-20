@@ -120,14 +120,39 @@ def _max_data_depth(V, depth_vals, coverage_threshold=0.10):
     return float(depth_vals[col].max()) if col.any() else float(depth_vals.max())
 
 
+_VAR_FALLBACKS_7 = {
+    "potential_temperature": "temperature",
+    "potential_density": "density",
+    "oxygen_concentration": "sci_oxy4_oxygen",
+    "chlorophyll": "sci_flbbcd_chlor_units",
+    "cdom": "sci_flbbcd_cdom_units",
+    "backscatter_700": "sci_flbbcd_bb_units",
+}
+
+
+def _var_in_grid(grid, var):
+    """Check if a variable (or its fallback) exists in the grid."""
+    if var in grid:
+        return True
+    fb = _VAR_FALLBACKS_7.get(var)
+    return fb is not None and fb in grid
+
+
 def _get_2d(grid, var):
     """
     Return the 2D (n_time, n_depth) array for `var` from grid.
+    Tries fallback variable names if primary not found.
     Returns None if the variable is missing or not 2D time×depth.
     """
+    # Try primary name, then fallback
+    actual = var
     if var not in grid:
-        return None
-    v = grid[var].values
+        fb = _VAR_FALLBACKS_7.get(var)
+        if fb and fb in grid:
+            actual = fb
+        else:
+            return None
+    v = grid[actual].values
     if v.ndim != 2 or v.shape != (len(grid.time), len(grid.depth)):
         return None
     return v.copy()
@@ -161,11 +186,13 @@ def _contour_section(grid, var, title, units, cmap_name,
     One-panel filled contour section (pcolormesh + contour lines).
     overlay_var: optional second variable for overlaid black contours.
     """
-    if var not in grid:
+    if not _var_in_grid(grid, var):
         print(f"  SKIP: {var} not in grid")
         return None
 
-    V = grid[var].values.copy()
+    # Resolve actual variable name (may be a fallback)
+    actual_var = var if var in grid else _VAR_FALLBACKS_7.get(var, var)
+    V = grid[actual_var].values.copy()
     T = grid.time.values
     D = grid.depth.values
 
@@ -239,7 +266,7 @@ def _contour_section(grid, var, title, units, cmap_name,
 # ── 2. Dual-panel contour (e.g. O2 raw + lag-corrected) ──────
 def _dual_contour_section(grid, var1, var2, titles, units,
                           cmap_name, depth_max=None, plot_path=None):
-    vars_ok = [v for v in [var1, var2] if v in grid]
+    vars_ok = [v for v in [var1, var2] if _var_in_grid(grid, v)]
     if not vars_ok:
         print(f"  SKIP: neither {var1} nor {var2} in grid")
         return None
@@ -249,7 +276,7 @@ def _dual_contour_section(grid, var1, var2, titles, units,
 
     all_V = []
     for v in [var1, var2]:
-        if v in grid:
+        if _var_in_grid(grid, v):
             V = _get_2d(grid, v)
             if V is None:
                 print(f"  SKIP: {v} is not a 2D time×depth variable")
@@ -303,7 +330,7 @@ def plot_profile_envelopes(grid, plot_path=None):
         ("salinity",              "Salinity (PSU)",         "haline"),
         ("oxygen_concentration",  "Oxygen (µmol/l)",        "oxy"),
     ]
-    vars_present = [(v, l, c) for v, l, c in vars_cfg if v in grid]
+    vars_present = [(v, l, c) for v, l, c in vars_cfg if _var_in_grid(grid, v)]
     if not vars_present:
         print("  SKIP: no variables for envelopes")
         return None
@@ -355,7 +382,15 @@ def plot_surface_properties(grid, plot_path=None):
     print("  Generating surface properties timeseries...")
     T = grid.time.values
     D = grid.depth.values
-    surf = D <= 15  # top 15 m = "surface"
+
+    # Adaptive surface definition: top 5% of depth range, minimum 15m, max 50m
+    max_depth = float(D.max()) if len(D) > 0 else 1000
+    surf_depth = min(max(15.0, max_depth * 0.05), 50.0)
+    surf = D <= surf_depth
+    if not np.any(surf):
+        # If no bins <= surf_depth, take the shallowest 10 bins
+        surf = np.zeros(len(D), dtype=bool)
+        surf[:min(10, len(D))] = True
 
     props = [
         ("potential_temperature", "SST (°C)",        "thermal"),
@@ -363,7 +398,7 @@ def plot_surface_properties(grid, plot_path=None):
         ("oxygen_concentration",  "O₂ (µmol/l)",      "oxy"),
         ("chlorophyll",           "Chl (mg m⁻³)",      "algae"),
     ]
-    props_ok = [(v, l, c) for v, l, c in props if v in grid]
+    props_ok = [(v, l, c) for v, l, c in props if _var_in_grid(grid, v)]
     if not props_ok:
         print("  SKIP: no surface vars")
         return None
@@ -460,19 +495,43 @@ def plot_isotherm_depths(grid, plot_path=None):
     ax = axes[0]
     V_temp = _get_2d(grid, "potential_temperature")
     if V_temp is not None:
-        for T_iso, col in [(28, "#d62728"), (25, "#ff7f0e"),
-                           (20, "#2ca02c"), (15, "#1f77b4"), (10, "#9467bd")]:
+        # Auto-detect appropriate isotherm levels based on data range
+        valid_temps = V_temp[np.isfinite(V_temp)]
+        if len(valid_temps) > 100:
+            t_min_data = float(np.percentile(valid_temps, 5))
+            t_max_data = float(np.percentile(valid_temps, 95))
+            t_range = t_max_data - t_min_data
+            # Generate 5 evenly-spaced isotherm values within the data range
+            if t_range > 1.0:
+                iso_values = np.linspace(t_min_data + t_range * 0.15,
+                                         t_max_data - t_range * 0.15, 5)
+                iso_values = [round(v, 1) for v in iso_values]
+            else:
+                iso_values = np.linspace(t_min_data + 0.1, t_max_data - 0.1, 3)
+                iso_values = [round(v, 2) for v in iso_values]
+        else:
+            iso_values = [28, 25, 20, 15, 10]  # default tropical
+
+        colors = ["#d62728", "#ff7f0e", "#2ca02c", "#1f77b4", "#9467bd"]
+        has_data = False
+        for T_iso, col in zip(iso_values, colors[:len(iso_values)]):
             depths = _interp_threshold(V_temp, D_vals, T_iso, above=True)
             ok = np.isfinite(depths)
             if ok.any():
                 ax.plot(T_vals[ok], depths[ok], linewidth=1.5,
                         color=col, label=f"{T_iso}°C")
-        ax.invert_yaxis()
-        ax.set_ylim(500, 0)
-        ax.set_ylabel("Depth (m)", fontsize=11)
-        ax.set_title("Isotherm Depths", fontsize=11)
-        ax.legend(fontsize=9, ncol=5, loc="upper right")
-        ax.grid(True, linestyle="--", alpha=0.4)
+                has_data = True
+        if has_data:
+            ax.invert_yaxis()
+            ax.set_ylim(min(500, float(D_vals.max())), 0)
+            ax.set_ylabel("Depth (m)", fontsize=11)
+            ax.set_title("Isotherm Depths", fontsize=11)
+            ax.legend(fontsize=9, ncol=5, loc="upper right")
+            ax.grid(True, linestyle="--", alpha=0.4)
+        else:
+            t_range_str = (f"{t_min_data:.1f}–{t_max_data:.1f}°C"
+                           if 't_min_data' in dir() else "unknown")
+            ax.set_title(f"Isotherm Depths — no crossings found (T range: {t_range_str})")
     else:
         axes[0].set_title("Isotherm Depths — no temperature data")
 
@@ -480,20 +539,42 @@ def plot_isotherm_depths(grid, plot_path=None):
     ax = axes[1]
     V_pden = _get_2d(grid, "potential_density")
     if V_pden is not None:
-        for rho, col in [(1024.0, "#d62728"), (1025.0, "#ff7f0e"),
-                         (1025.5, "#2ca02c"), (1026.0, "#1f77b4"),
-                         (1026.5, "#9467bd")]:
+        # Auto-detect isopycnal levels from data range
+        valid_rho = V_pden[np.isfinite(V_pden)]
+        if len(valid_rho) > 100:
+            rho_min = float(np.percentile(valid_rho, 5))
+            rho_max = float(np.percentile(valid_rho, 95))
+            rho_range = rho_max - rho_min
+            if rho_range > 0.5:
+                iso_rho = np.linspace(rho_min + rho_range * 0.15,
+                                      rho_max - rho_range * 0.15, 5)
+                iso_rho = [round(v, 2) for v in iso_rho]
+            else:
+                iso_rho = [round(rho_min + 0.1, 2), round((rho_min+rho_max)/2, 2),
+                           round(rho_max - 0.1, 2)]
+        else:
+            iso_rho = [1024.0, 1025.0, 1025.5, 1026.0, 1026.5]
+
+        colors = ["#d62728", "#ff7f0e", "#2ca02c", "#1f77b4", "#9467bd"]
+        has_data = False
+        for rho, col in zip(iso_rho, colors[:len(iso_rho)]):
             depths = _interp_threshold(V_pden, D_vals, rho, above=False)
             ok = np.isfinite(depths)
             if ok.any():
                 ax.plot(T_vals[ok], depths[ok], linewidth=1.5,
                         color=col, label=f"σ₀={rho-1000:.1f}")
-        ax.invert_yaxis()
-        ax.set_ylim(600, 0)
-        ax.set_ylabel("Depth (m)", fontsize=11)
-        ax.set_title("Isopycnal Depths", fontsize=11)
-        ax.legend(fontsize=9, ncol=5, loc="upper right")
-        ax.grid(True, linestyle="--", alpha=0.4)
+                has_data = True
+        if has_data:
+            ax.invert_yaxis()
+            ax.set_ylim(min(600, float(D_vals.max())), 0)
+            ax.set_ylabel("Depth (m)", fontsize=11)
+            ax.set_title("Isopycnal Depths", fontsize=11)
+            ax.legend(fontsize=9, ncol=5, loc="upper right")
+            ax.grid(True, linestyle="--", alpha=0.4)
+        else:
+            rho_range_str = (f"{rho_min:.1f}–{rho_max:.1f}"
+                             if 'rho_min' in dir() else "unknown")
+            ax.set_title(f"Isopycnal Depths — no crossings found (ρ range: {rho_range_str})")
     else:
         axes[1].set_title("Isopycnal Depths — no density data")
 
@@ -506,7 +587,7 @@ def plot_isotherm_depths(grid, plot_path=None):
 def plot_hovmoller(grid, plot_path=None):
     """Temperature anomaly (T − time-mean T at each depth)."""
     print("  Generating Hovmöller anomaly plot...")
-    if "potential_temperature" not in grid:
+    if not _var_in_grid(grid, "potential_temperature"):
         print("  SKIP: no temperature")
         return None
 
@@ -701,7 +782,7 @@ def plot_overview_section(grid, plot_path=None):
         ("chlorophyll",           "Chl (mg m⁻³)",      "algae",     None,  0.1),
         ("potential_density",     "σ₀ (kg m⁻³)",       "dense",     None,  None),
     ]
-    panels_ok = [(v, l, c, vn, vx) for v, l, c, vn, vx in panels if v in grid]
+    panels_ok = [(v, l, c, vn, vx) for v, l, c, vn, vx in panels if _var_in_grid(grid, v)]
     if not panels_ok:
         print("  SKIP: no variables for overview")
         return None
