@@ -349,40 +349,55 @@ def read_science(data_dir, cache_dir):
 
 
 def filter_gps(flight):
+    """
+    Filter GPS data using a soft IQR-based outlier approach.
+
+    Does NOT use the pre-detected bounding box from .mlg headers. Instead,
+    computes statistics from the actual decoded GPS data and only rejects
+    extreme statistical outliers. This correctly handles long deployments
+    where the glider travels far beyond the initial GPS sample.
+    """
     print("  Filtering GPS data...")
+    GPS_MIN_FIXES_FOR_OUTLIER = 50  # need at least this many to do stats
+
     for var in ["m_lat", "m_lon", "c_wpt_lat", "c_wpt_lon"]:
         if var not in flight:
             continue
         t, v = flight[var]
         n_before = len(v)
         good = np.ones(len(v), dtype=bool)
-        # Basic sanity: reject null-island and physically impossible values
+
+        # Hard sanity: reject null-island and physically impossible values
         good &= np.abs(v) > 0.01
         good &= np.abs(v) < (90 if "lat" in var else 180)
 
-        # GPS bounding box: ONLY apply if bounds were actually detected
-        # (not global defaults) AND we had enough fixes to trust the box.
-        # With < 50 fixes from .mlg headers, the box is unreliable for
-        # long deployments — skip it and let the hemisphere filter handle
-        # gross errors later.
-        bounds_are_global = (GPS_LAT_MIN <= -89 and GPS_LAT_MAX >= 89)
-        if not bounds_are_global:
-            # Use a very generous approach: only reject points that are
-            # clearly outside the deployment region (>10° beyond detected box)
-            margin = 10.0  # degrees — generous enough for any real transit
-            if var == "m_lat":
-                good &= (v >= GPS_LAT_MIN - margin) & (v <= GPS_LAT_MAX + margin)
-            elif var == "m_lon":
-                good &= (v >= GPS_LON_MIN - margin) & (v <= GPS_LON_MAX + margin)
-            elif var == "c_wpt_lat":
-                good &= (v >= GPS_LAT_MIN - margin) & (v <= GPS_LAT_MAX + margin)
-            elif var == "c_wpt_lon":
-                good &= (v >= GPS_LON_MIN - margin) & (v <= GPS_LON_MAX + margin)
+        # Soft outlier filter: only if we have enough points to compute stats
+        # Uses the ACTUAL GPS data distribution, not the pre-detected box
+        finite_vals = v[good & np.isfinite(v)]
+        if len(finite_vals) >= GPS_MIN_FIXES_FOR_OUTLIER:
+            q1 = np.percentile(finite_vals, 25)
+            q3 = np.percentile(finite_vals, 75)
+            iqr = q3 - q1
+            if iqr < 0.1:
+                # Very tight cluster — use a generous fixed margin
+                lower = q1 - 5.0
+                upper = q3 + 5.0
+            else:
+                # Reject only extreme outliers: > 5x IQR beyond quartiles
+                lower = q1 - 5.0 * iqr
+                upper = q3 + 5.0 * iqr
+            outlier_mask = (v < lower) | (v > upper)
+            good &= ~outlier_mask
+        # else: too few points — only apply basic sanity checks above
 
         flight[var] = (t[good], v[good])
         n_removed = n_before - len(v[good])
         if n_removed > 0:
-            print(f"  {var}: removed {n_removed}/{n_before} bad points")
+            pct = 100.0 * n_removed / max(n_before, 1)
+            print(f"  {var}: removed {n_removed}/{n_before} bad points ({pct:.1f}%)")
+            if pct > 20:
+                print(f"  WARNING: {var} filter rejected {pct:.1f}% of fixes — "
+                      f"check if geographic filtering is too aggressive")
 
     return flight
 
@@ -489,9 +504,27 @@ def sync_data(flight, science):
         t, v = t[umask], v[umask]
         if len(t) < 2:
             continue
+
+        # Compute native sampling interval for gap-limiting
+        dt_native = float(np.median(np.diff(t)))
+        max_gap = max(dt_native * 5.0, 30.0)  # 5x native or 30s minimum
+
         f = interp1d(t, v, bounds_error=False, fill_value=np.nan)
-        synced[var] = f(master_t)
-        print(f"  {var}: {np.sum(np.isfinite(synced[var])):,}/{n:,} valid")
+        interpolated = f(master_t)
+
+        # Gap-limit: NaN out interpolated values where nearest real sample
+        # is farther than max_gap. Prevents bridging large data gaps.
+        idx = np.searchsorted(t, master_t, side='left')
+        idx = np.clip(idx, 1, len(t) - 1)
+        dist_left = np.abs(master_t - t[idx - 1])
+        dist_right = np.abs(master_t - t[np.minimum(idx, len(t) - 1)])
+        nearest_dist = np.minimum(dist_left, dist_right)
+        gap_mask = nearest_dist > max_gap
+        interpolated[gap_mask] = np.nan
+
+        synced[var] = interpolated
+        n_valid = int(np.sum(np.isfinite(interpolated)))
+        print(f"  {var}: {n_valid:,}/{n:,} valid (native dt={dt_native:.1f}s, max_gap={max_gap:.0f}s)")
 
     for var, (t, v) in flight.items():
         if len(t) < 2:
@@ -502,9 +535,23 @@ def sync_data(flight, science):
         t, v = t[umask], v[umask]
         if len(t) < 2:
             continue
+
+        dt_native = float(np.median(np.diff(t)))
+        max_gap = max(dt_native * 5.0, 30.0)
+
         f = interp1d(t, v, bounds_error=False, fill_value=np.nan)
-        synced[var] = f(master_t)
-        print(f"  {var}: {np.sum(np.isfinite(synced[var])):,}/{n:,} valid")
+        interpolated = f(master_t)
+
+        idx = np.searchsorted(t, master_t, side='left')
+        idx = np.clip(idx, 1, len(t) - 1)
+        dist_left = np.abs(master_t - t[idx - 1])
+        dist_right = np.abs(master_t - t[np.minimum(idx, len(t) - 1)])
+        nearest_dist = np.minimum(dist_left, dist_right)
+        gap_mask = nearest_dist > max_gap
+        interpolated[gap_mask] = np.nan
+
+        synced[var] = interpolated
+        print(f"  {var}: {np.sum(np.isfinite(interpolated)):,}/{n:,} valid")
 
     return synced
 
